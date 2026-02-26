@@ -280,6 +280,11 @@ class RayPPOTrainer:
         self.use_rm = need_reward_model(self.config)
 
         self.use_critic = need_critic(self.config)
+
+        # Cartridge sync: enabled when actor.cartridge.enabled is True
+        actor_cfg = config.actor_rollout_ref.get("actor", {})
+        cartridge_cfg = actor_cfg.get("cartridge", {}) if hasattr(actor_cfg, "get") else {}
+        self._cartridge_sync_enabled = cartridge_cfg.get("enabled", False) if hasattr(cartridge_cfg, "get") else False
         self.ray_worker_group_cls = ray_worker_group_cls
         self.device_name = device_name if device_name else self.config.trainer.device
         self.validation_generations_logger = ValidationGenerationsLogger(
@@ -1096,7 +1101,122 @@ class RayPPOTrainer:
             values = self.critic_wg.compute_values(batch)
         return values
 
+    def _get_patient_documents(self):
+        """Load patient documents + names from LongHealth (cached after first call)."""
+        if not hasattr(self, "_patient_docs"):
+            import requests as http_req
+            print("[cartridge] Loading LongHealth patient documents for teacher...")
+            data = http_req.get(
+                "https://raw.githubusercontent.com/kbressem/LongHealth/refs/heads/main/data/benchmark_v5.json"
+            ).json()
+            self._patient_docs = {}
+            self._patient_names = {}
+            for pid, patient in data.items():
+                self._patient_docs[pid] = "\n\n".join(
+                    f"--- {doc_id} ---\n{text}" for doc_id, text in patient["texts"].items()
+                )
+                self._patient_names[pid] = patient["name"]
+            print(f"[cartridge] Loaded documents for {len(self._patient_docs)} patients: {list(self._patient_names.values())}")
+        return self._patient_docs
+
+    def _compute_teacher_logprobs_via_tokasaurus(self, batch: DataProto) -> DataProto:
+        """Compute teacher logprobs via Tokasaurus with full document context.
+
+        Sends each sample to Tokasaurus with full patient documents prepended
+        (no cartridge). Looks up documents by patient_id from the batch.
+        """
+        import requests as http_requests
+        import json
+        import base64
+
+        batch_size = batch.batch["input_ids"].shape[0]
+        response_length = batch.batch["responses"].shape[-1]
+        tokasaurus_url = self.config.actor_rollout_ref.rollout.custom.get("tokasaurus_url", "")
+        patient_docs = self._get_patient_documents()
+
+        all_ref_logprobs = []
+        teacher_hits = 0
+        for i in range(batch_size):
+            # Extract valid token IDs (remove padding)
+            attention_mask = batch.batch["attention_mask"][i]
+            input_ids = batch.batch["input_ids"][i]
+            valid_ids = input_ids[attention_mask.bool()].tolist()
+
+            response_mask = batch.batch["response_mask"][i]
+            valid_response_len = int(response_mask.sum().item())
+
+            # Look up documents by decoding prompt text and matching patient name.
+            # non_tensor_batch fields get dropped by veRL's pipeline, so we
+            # extract the patient identity from the actual prompt tokens.
+            doc_text = ""
+            prompt_text = self.tokenizer.decode(valid_ids[:300], skip_special_tokens=True)
+            for pid, pname in self._patient_names.items():
+                if pname and pname in prompt_text:
+                    doc_text = patient_docs[pid]
+                    break
+
+            if not doc_text:
+                # No document context — use empty (teacher = base model with no context)
+                all_ref_logprobs.append([0.0] * response_length)
+                continue
+
+            # Tokenize document
+            doc_ids = self.tokenizer.encode(doc_text, add_special_tokens=False)
+
+            # Full teacher prompt: [doc_tokens + prompt_tokens + response_tokens]
+            full_prompt = doc_ids + valid_ids
+            payload = {
+                "model": "default",
+                "prompt": full_prompt,
+                "max_tokens": 1,
+                "temperature": 0.0,
+                "logprobs_in_fingerprint": True,
+                # NO cartridges — teacher sees full documents
+            }
+
+            try:
+                resp = http_requests.post(
+                    f"{tokasaurus_url}/custom/cartridge/completions",
+                    json=payload,
+                    timeout=120,
+                )
+                if resp.status_code == 200:
+                    data = resp.json()
+                    fp = json.loads(data.get("system_fingerprint", "{}"))
+                    packed = fp.get("packed_chosen_logprobs")
+                    if packed and packed[0]:
+                        all_lp = np.frombuffer(base64.b64decode(packed[0]), dtype=np.float32)
+                        # Extract logprobs for the response tokens only
+                        # The logprobs cover the full prompt (shifted by 1 for next-token)
+                        # Skip doc + prompt tokens, keep only response tokens
+                        skip = len(full_prompt) - valid_response_len
+                        teacher_lp = all_lp[max(0, skip - 1):][:valid_response_len].tolist()
+                        teacher_hits += 1
+                    else:
+                        teacher_lp = [0.0] * valid_response_len
+                else:
+                    print(f"[cartridge] Teacher HTTP {resp.status_code} for sample {i}")
+                    teacher_lp = [0.0] * valid_response_len
+            except Exception as e:
+                print(f"[cartridge] Teacher call failed for sample {i}: {e}")
+                teacher_lp = [0.0] * valid_response_len
+
+            # Pad to response_length
+            padded = teacher_lp + [0.0] * (response_length - len(teacher_lp))
+            all_ref_logprobs.append(padded[:response_length])
+
+        print(f"[cartridge] Teacher logprobs: {teacher_hits}/{batch_size} samples got document context")
+
+        ref_log_prob_tensor = torch.tensor(all_ref_logprobs, dtype=torch.float32)
+        ref_log_prob = DataProto.from_tensordict(
+            tu.get_tensordict({"ref_log_prob": ref_log_prob_tensor})
+        )
+        return ref_log_prob
+
     def _compute_ref_log_prob(self, batch: DataProto) -> DataProto:
+        # Cartridge mode: the ref worker's compute_ref_log_prob detects _cartridge_enabled
+        # and runs _compute_ref_with_documents (ref model with full patient docs prepended).
+
         if self.use_legacy_worker_impl == "disable":
             # step 1: convert dataproto to tensordict.
             batch_td = batch.to_tensordict()
@@ -1147,6 +1267,30 @@ class RayPPOTrainer:
             old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
             old_log_prob_mfu = 0
         return old_log_prob, old_log_prob_mfu
+
+    def _sync_cartridge_to_tokasaurus(self):
+        """Save updated cartridge and tell Tokasaurus to reload it.
+
+        Called after each actor update when cartridge training is enabled.
+        Uses the sync_cartridge mechanism on the rollout replica.
+        """
+        import tempfile, os
+
+        cartridge_path = os.path.join(tempfile.gettempdir(), "verl_cartridge_latest.pt")
+
+        # Ask the actor worker to save the cartridge
+        # The actor worker has access to self._cartridge_cache
+        self.actor_rollout_wg.save_cartridge(cartridge_path)
+
+        # Tell Tokasaurus rollout replicas to reload
+        # This triggers force_redownload=True on the next request
+        if hasattr(self, "rollout_replicas"):
+            import asyncio
+            for replica in self.rollout_replicas:
+                asyncio.get_event_loop().run_until_complete(
+                    replica.sync_cartridge(cartridge_path)
+                )
+            print(f"[cartridge] Synced updated cartridge to Tokasaurus: {cartridge_path}")
 
     def _update_actor(self, batch: DataProto) -> DataProto:
         rollout_config = self.config.actor_rollout_ref.rollout
@@ -1519,6 +1663,11 @@ class RayPPOTrainer:
                         # update weights from trainer to rollout
                         with marked_timer("update_weights", timing_raw, color="red"):
                             self.checkpoint_manager.update_weights()
+
+                        # --- Cartridge sync: save updated cache → Tokasaurus reloads ---
+                        if getattr(self, "_cartridge_sync_enabled", False):
+                            with marked_timer("cartridge_sync", timing_raw, color="yellow"):
+                                self._sync_cartridge_to_tokasaurus()
 
                         actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                         metrics.update(actor_output_metrics)

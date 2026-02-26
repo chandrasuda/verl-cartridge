@@ -456,13 +456,29 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 else:
                     actor_module_class = AutoModel
 
-            actor_module = actor_module_class.from_pretrained(
-                pretrained_model_name_or_path=local_path,
-                torch_dtype=torch_dtype,
-                config=actor_model_config,
-                trust_remote_code=trust_remote_code,
-                attn_implementation=attn_implementation,
-            )
+            # Cartridge mode: use FlexLlamaForCausalLM instead of standard Llama
+            _cart_cfg = self.config.actor.get("cartridge", {})
+            _cart_enabled = _cart_cfg.get("enabled", False) if isinstance(_cart_cfg, dict) else getattr(_cart_cfg, "enabled", False)
+            if _cart_enabled and role == "actor":
+                from cartridges.models.llama.modeling_llama import FlexLlamaForCausalLM
+                actor_module_class = FlexLlamaForCausalLM
+                if self.rank == 0:
+                    print("[cartridge] Using FlexLlamaForCausalLM (supports TrainableCache)")
+                # FlexLlama doesn't use attn_implementation kwarg
+                actor_module = actor_module_class.from_pretrained(
+                    pretrained_model_name_or_path=local_path,
+                    torch_dtype=torch_dtype,
+                    config=actor_model_config,
+                    trust_remote_code=trust_remote_code,
+                )
+            else:
+                actor_module = actor_module_class.from_pretrained(
+                    pretrained_model_name_or_path=local_path,
+                    torch_dtype=torch_dtype,
+                    config=actor_model_config,
+                    trust_remote_code=trust_remote_code,
+                    attn_implementation=attn_implementation,
+                )
 
             # Apply Liger kernel to the model if use_liger is set to True
             if use_liger:
@@ -522,6 +538,89 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                     "bias": "none",
                 }
                 actor_module = get_peft_model(actor_module, LoraConfig(**lora_config))
+
+        # --- Cartridge mode: freeze base model, load TrainableCache, wrap ---
+        cartridge_config = self.config.actor.get("cartridge", {})
+        self._cartridge_enabled = cartridge_config.get("enabled", False) if isinstance(cartridge_config, dict) else getattr(cartridge_config, "enabled", False)
+        self._cartridge_cache = None
+
+        if self._cartridge_enabled and role == "actor":
+            from cartridges.cache import TrainableCache, AttnConfig
+            from cartridges.train import CacheAndModel
+            from cartridges.initialization import KVFromText
+
+            if self.rank == 0:
+                print("[cartridge] Freezing all base model parameters")
+            for param in actor_module.parameters():
+                param.requires_grad = False
+
+            # Build AttnConfig from the model
+            attn_config = AttnConfig(
+                n_layers=actor_model_config.num_hidden_layers,
+                n_heads=actor_model_config.num_key_value_heads,
+                head_dim=(
+                    actor_model_config.head_dim
+                    if hasattr(actor_model_config, "head_dim")
+                    else actor_model_config.hidden_size // actor_model_config.num_attention_heads
+                ),
+            )
+
+            # Initialize the cache
+            num_tokens = cartridge_config.get("num_tokens", 2048) if isinstance(cartridge_config, dict) else getattr(cartridge_config, "num_tokens", 2048)
+            num_frozen = cartridge_config.get("num_frozen_tokens", 1) if isinstance(cartridge_config, dict) else getattr(cartridge_config, "num_frozen_tokens", 1)
+            checkpoint_path = cartridge_config.get("checkpoint_path", None) if isinstance(cartridge_config, dict) else getattr(cartridge_config, "checkpoint_path", None)
+
+            if checkpoint_path:
+                if self.rank == 0:
+                    print(f"[cartridge] Loading pre-trained cache from {checkpoint_path}")
+                # If it's a HuggingFace repo, download to local path first
+                import os
+                if "/" in checkpoint_path and not os.path.exists(checkpoint_path):
+                    from huggingface_hub import hf_hub_download, list_repo_files
+                    # Find the .pt file in the repo
+                    repo_files = list_repo_files(checkpoint_path)
+                    pt_files = [f for f in repo_files if f.endswith(".pt")]
+                    if not pt_files:
+                        raise FileNotFoundError(f"No .pt file found in {checkpoint_path}: {repo_files}")
+                    local_path = hf_hub_download(
+                        repo_id=checkpoint_path,
+                        filename=pt_files[0],
+                    )
+                    if self.rank == 0:
+                        print(f"[cartridge] Downloaded from HF to {local_path}")
+                else:
+                    local_path = checkpoint_path
+                # Handle checkpoint key naming: some checkpoints use "fixed_keys"
+                # but TrainableCache.from_pretrained expects "frozen_keys"
+                import torch as _torch
+                _ckpt = _torch.load(local_path, map_location="cpu", weights_only=False)
+                if "fixed_keys" in _ckpt and "frozen_keys" not in _ckpt:
+                    _ckpt["frozen_keys"] = _ckpt.pop("fixed_keys")
+                    _ckpt["frozen_values"] = _ckpt.pop("fixed_values")
+                    _tmp_path = local_path + ".fixed"
+                    _torch.save(_ckpt, _tmp_path)
+                    local_path = _tmp_path
+                    if self.rank == 0:
+                        print("[cartridge] Renamed fixed_keys → frozen_keys in checkpoint")
+                del _ckpt
+                cache = TrainableCache.from_pretrained(local_path)
+            else:
+                if self.rank == 0:
+                    print(f"[cartridge] Initializing cache with {num_tokens} tokens via KVFromText")
+                initializer = KVFromText(max_tokens=num_tokens, num_frozen_tokens=num_frozen)
+                cache = initializer.initialize_kv_cache(
+                    tokenizer=self.tokenizer, model=actor_module, attn_config=attn_config,
+                )
+
+            cache = cache.to(get_device_id())
+            self._cartridge_cache = cache
+
+            # Wrap: CacheAndModel passes past_key_values=cache to FlexLlamaForCausalLM
+            actor_module = CacheAndModel(cache, actor_module)
+            if self.rank == 0:
+                trainable_params = sum(p.numel() for p in cache.parameters() if p.requires_grad)
+                total_params = sum(p.numel() for p in actor_module.parameters())
+                print(f"[cartridge] Trainable params: {trainable_params:,} / {total_params:,} total")
 
         self.use_orig_params = fsdp_config.get("use_orig_params", False)
         if self.config.actor.get("freeze_vision_tower", False):
@@ -637,7 +736,14 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         if role == "actor" and optim_config is not None:
             from verl.utils.torch_functional import get_constant_schedule_with_warmup, get_cosine_schedule_with_warmup
 
-            actor_optimizer = build_optimizer(actor_module_fsdp.parameters(), optim_config)
+            if self._cartridge_enabled and self._cartridge_cache is not None:
+                # Cartridge mode: only optimize cache parameters (base model is frozen)
+                cartridge_lr = cartridge_config.get("lr", 2e-2) if isinstance(cartridge_config, dict) else getattr(cartridge_config, "lr", 2e-2)
+                actor_optimizer = torch.optim.Adam(self._cartridge_cache.parameters(), lr=cartridge_lr)
+                if self.rank == 0:
+                    print(f"[cartridge] Optimizer: Adam(cache.parameters(), lr={cartridge_lr})")
+            else:
+                actor_optimizer = build_optimizer(actor_module_fsdp.parameters(), optim_config)
 
             total_steps = optim_config.get("total_training_steps", 0)
             num_warmup_steps = int(optim_config.get("lr_warmup_steps", -1))
@@ -913,6 +1019,9 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             self.actor = DataParallelPPOActor(
                 config=actor_cfg, actor_module=self.actor_module_fsdp, actor_optimizer=self.actor_optimizer
             )
+            # Propagate cartridge flag so dp_actor uses the cartridge forward path
+            self.actor._cartridge_enabled = getattr(self, "_cartridge_enabled", False)
+            self.actor._cartridge_cache = getattr(self, "_cartridge_cache", None)
 
         if self._is_rollout:
             self._build_rollout(trust_remote_code=self.config.model.get("trust_remote_code", False))
@@ -980,6 +1089,13 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 processing_class=self.processor if self.processor is not None else self.tokenizer,
                 checkpoint_config=checkpoint_contents,
             )
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def save_cartridge(self, path: str):
+        """Save the updated TrainableCache to disk (for Tokasaurus sync)."""
+        if self._cartridge_cache is not None and self.rank == 0:
+            self._cartridge_cache.save(path)
+            print(f"[cartridge] Saved cache to {path}")
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
     @DistProfiler.annotate(color="red", role="actor_update")
@@ -1133,12 +1249,21 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     @DistProfiler.annotate(color="olive", role="ref_compute_log_prob")
     def compute_ref_log_prob(self, data: DataProto):
         if self._is_lora:
-            # if _is_lora, actor without lora applied is the ref
             data.meta_info["is_lora"] = True
             return self.compute_log_prob(data)
+
+        # --- Cartridge mode: ref model with document context ---
+        if getattr(self, "_cartridge_enabled", False):
+            try:
+                return self._compute_ref_with_documents(data)
+            except Exception as e:
+                print(f"[cartridge-ref] ERROR in _compute_ref_with_documents: {e}")
+                import traceback
+                traceback.print_exc()
+                # Fall back to standard ref model
+                return self._compute_ref_without_documents(data)
+
         assert self._is_ref
-        # else:
-        # otherwise, the class have a standalone ref model
 
         micro_batch_size = self.config.ref.log_prob_micro_batch_size_per_gpu
         data.meta_info["micro_batch_size"] = micro_batch_size
@@ -1147,20 +1272,167 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         data.meta_info["use_dynamic_bsz"] = self.config.ref.log_prob_use_dynamic_bsz
         data.meta_info.setdefault("pad_token_id", self.tokenizer.pad_token_id)
         with self.ulysses_sharding_manager:
-            data = data.to("cpu")  # data will to device with each micro batch on ref.compute_log_prob
+            data = data.to("cpu")
             outputs = self.ref_policy.compute_log_prob(data=data, calculate_entropy=False)
             output = DataProto.from_dict(tensors={"ref_log_prob": outputs["log_probs"]})
 
         output = output.to("cpu")
-
-        # https://pytorch.org/docs/stable/notes/fsdp.html#fsdp-notes
-        # unshard the root FSDP module
         if self.world_size > 1:
             if fsdp_version(self.ref_policy.actor_module) == 1:
                 self.ref_policy.actor_module._handle.reshard(True)
             elif fsdp_version(self.ref_policy.actor_module) == 2:
                 self.ref_policy.actor_module.reshard()
+        return output
 
+    def _compute_ref_with_documents(self, data: DataProto):
+        """Compute ref logprobs with full patient documents prepended.
+
+        For each sample:
+        1. Decode prompt tokens → match patient name → look up documents
+        2. Tokenize documents, prepend to input_ids
+        3. Forward pass through ref model (standard Llama with flash attention)
+        4. Extract logprobs for only the response tokens
+        """
+        import os
+        from verl.utils.torch_functional import logprobs_from_logits
+
+        # Load patient documents (cached). Try local file first, then HTTP.
+        if not hasattr(self, "_patient_docs"):
+            import json as _json
+            self._patient_docs = {}
+            self._patient_names = {}
+            # Try local file (saved by prepare_data.py or modal_train.py)
+            lh_path = "/tmp/longhealth_data.json"
+            try:
+                if os.path.exists(lh_path):
+                    with open(lh_path) as f:
+                        lh_data = _json.load(f)
+                    print(f"[cartridge-ref] Loaded LongHealth from {lh_path}")
+                else:
+                    import requests as http_req
+                    print("[cartridge-ref] Downloading LongHealth data...")
+                    lh_data = http_req.get(
+                        "https://raw.githubusercontent.com/kbressem/LongHealth/refs/heads/main/data/benchmark_v5.json",
+                        timeout=30,
+                    ).json()
+                    # Save for future use
+                    with open(lh_path, "w") as f:
+                        _json.dump(lh_data, f)
+                    print(f"[cartridge-ref] Downloaded and saved to {lh_path}")
+
+                for pid, patient in lh_data.items():
+                    self._patient_docs[pid] = "\n\n".join(
+                        f"--- {did} ---\n{txt}" for did, txt in patient["texts"].items()
+                    )
+                    self._patient_names[pid] = patient["name"]
+                print(f"[cartridge-ref] {len(self._patient_docs)} patients loaded")
+            except Exception as e:
+                print(f"[cartridge-ref] FAILED to load documents: {e}")
+                # Return empty — will use ref model without documents
+                return self._compute_ref_without_documents(data)
+
+        batch_size = data.batch["input_ids"].shape[0]
+        response_length = data.batch["responses"].shape[-1]
+        temperature = data.meta_info.get("temperature", 1.0)
+        device = get_device_id()
+
+        # Get ref model (unwrap FSDP if needed)
+        ref_model = self.ref_module_fsdp
+
+        if self._is_offload_param:
+            load_fsdp_model_to_gpu(ref_model)
+
+        all_ref_logprobs = []
+        teacher_hits = 0
+
+        with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            for i in range(batch_size):
+                attention_mask = data.batch["attention_mask"][i]
+                input_ids = data.batch["input_ids"][i]
+                valid_ids = input_ids[attention_mask.bool()]
+                response_mask = data.batch["response_mask"][i]
+                valid_response_len = int(response_mask.sum().item())
+
+                # Find patient documents from prompt text
+                prompt_text = self.tokenizer.decode(valid_ids[:300].tolist(), skip_special_tokens=True)
+                doc_ids_list = []
+                matched_name = None
+                for pid, pname in self._patient_names.items():
+                    if pname and pname in prompt_text:
+                        doc_text = self._patient_docs[pid]
+                        doc_ids_list = self.tokenizer.encode(doc_text, add_special_tokens=False)
+                        matched_name = pname
+                        teacher_hits += 1
+                        break
+                if not matched_name and i == 0:
+                    print(f"[cartridge-ref] NO MATCH for sample 0. First 100 chars: {prompt_text[:100]}")
+
+                # Build extended input: [doc_tokens + original_valid_tokens]
+                if doc_ids_list:
+                    doc_tensor = torch.tensor(doc_ids_list, dtype=torch.long, device=device)
+                    ext_ids = torch.cat([doc_tensor, valid_ids.to(device)]).unsqueeze(0)
+                else:
+                    ext_ids = valid_ids.to(device).unsqueeze(0)
+
+                ext_len = ext_ids.shape[1]
+                ext_mask = torch.ones(1, ext_len, dtype=torch.long, device=device)
+                ext_pos = torch.arange(ext_len, dtype=torch.long, device=device).unsqueeze(0)
+
+                # Forward pass through ref model
+                output = ref_model(
+                    input_ids=ext_ids,
+                    attention_mask=ext_mask,
+                    position_ids=ext_pos,
+                    use_cache=False,
+                )
+
+                logits = output.logits.squeeze(0) / temperature  # (ext_len, vocab)
+
+                # Extract response logprobs
+                # Response tokens are at the END of the extended sequence
+                # shifted by 1 for next-token prediction
+                doc_prompt_len = ext_len - valid_response_len
+                shifted_ids = ext_ids.squeeze(0)[doc_prompt_len:]  # response token ids
+                shifted_logits = logits[doc_prompt_len - 1:-1]  # logits predicting response tokens
+
+                if shifted_logits.shape[0] > 0 and shifted_ids.shape[0] > 0:
+                    resp_lp = logprobs_from_logits(logits=shifted_logits, labels=shifted_ids)
+                else:
+                    resp_lp = torch.zeros(valid_response_len, device=device)
+
+                # Pad to response_length
+                if resp_lp.shape[0] < response_length:
+                    pad = torch.zeros(response_length - resp_lp.shape[0], device=device)
+                    resp_lp = torch.cat([resp_lp, pad])
+                else:
+                    resp_lp = resp_lp[:response_length]
+
+                all_ref_logprobs.append(resp_lp)
+
+        ref_log_prob = torch.stack(all_ref_logprobs, dim=0).float().cpu()
+        print(f"[cartridge-ref] Teacher: {teacher_hits}/{batch_size} with docs, mean_lp={ref_log_prob[ref_log_prob != 0].mean():.4f}")
+
+        if self._is_offload_param:
+            offload_fsdp_model_to_cpu(ref_model)
+
+        output = DataProto.from_dict(tensors={"ref_log_prob": ref_log_prob})
+        output = output.to("cpu")
+        return output
+
+    def _compute_ref_without_documents(self, data):
+        """Fallback: compute ref logprobs without document context."""
+        print("[cartridge-ref] Falling back to ref model without documents")
+        micro_batch_size = self.config.ref.log_prob_micro_batch_size_per_gpu
+        data.meta_info["micro_batch_size"] = micro_batch_size
+        data.meta_info["temperature"] = self.config.rollout.temperature
+        data.meta_info["max_token_len"] = self.config.ref.log_prob_max_token_len_per_gpu
+        data.meta_info["use_dynamic_bsz"] = self.config.ref.log_prob_use_dynamic_bsz
+        data.meta_info.setdefault("pad_token_id", self.tokenizer.pad_token_id)
+        with self.ulysses_sharding_manager:
+            data = data.to("cpu")
+            outputs = self.ref_policy.compute_log_prob(data=data, calculate_entropy=False)
+            output = DataProto.from_dict(tensors={"ref_log_prob": outputs["log_probs"]})
+        output = output.to("cpu")
         return output
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)

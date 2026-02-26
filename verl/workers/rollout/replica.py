@@ -331,10 +331,17 @@ def _load_trtllm():
     return TRTLLMReplica
 
 
+def _load_tokasaurus():
+    from verl.workers.rollout.tokasaurus_rollout.async_tokasaurus_server import TokasaurusReplica
+
+    return TokasaurusReplica
+
+
 # Register built-in types
 RolloutReplicaRegistry.register("vllm", _load_vllm)
 RolloutReplicaRegistry.register("sglang", _load_sglang)
 RolloutReplicaRegistry.register("trtllm", _load_trtllm)
+RolloutReplicaRegistry.register("tokasaurus", _load_tokasaurus)
 
 
 # Original function for backward compatibility

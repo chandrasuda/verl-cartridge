@@ -146,6 +146,11 @@ class DataParallelPPOActor(BasePPOActor):
                 )
 
         response_length = micro_batch["responses"].size(-1)
+
+        # --- Cartridge mode: FlexLlamaForCausalLM takes (input_ids, seq_ids, position_ids) ---
+        if getattr(self, "_cartridge_enabled", False):
+            return self._forward_micro_batch_cartridge(micro_batch, temperature, response_length)
+
         multi_modal_inputs = {}
         if "multi_modal_inputs" in micro_batch.keys():
             from verl.utils.model import extract_multi_modal_inputs
@@ -420,6 +425,91 @@ class DataParallelPPOActor(BasePPOActor):
             invalidate_all_scales(self.actor_module)
 
         return grad_norm
+
+    def _forward_micro_batch_cartridge(
+        self, micro_batch: dict[str, torch.Tensor], temperature: float, response_length: int
+    ) -> dict[str, torch.Tensor]:
+        """Cartridge-specific forward pass.
+
+        FlexLlamaForCausalLM / CacheAndModel takes (input_ids, seq_ids, position_ids)
+        instead of (input_ids, attention_mask, position_ids).  We convert the
+        attention_mask to seq_ids (all tokens belong to sequence 0) and call the
+        wrapped model directly.
+        """
+        with torch.autocast(device_type=self.device_name, dtype=self.param_dtype):
+            input_ids = micro_batch["input_ids"]  # (bs, seqlen)
+            batch_size, seqlen = input_ids.shape
+            attention_mask = micro_batch["attention_mask"]
+            position_ids = micro_batch["position_ids"]
+
+            # CacheAndModel / FlexLlamaForCausalLM expects 1D tensors (no batch dim).
+            # FlexLlama internally does unsqueeze(0) to add the batch dimension.
+            # Process each sample in the micro-batch independently.
+            all_log_probs = []
+            for i in range(batch_size):
+                mask_i = attention_mask[i].bool()  # (seqlen,)
+                # CRITICAL: use boolean mask, NOT [:valid_len].
+                # input_ids is LEFT-padded: [0,0,PAD,tok1,tok2,...,resp1,resp2,PAD,0]
+                # [:valid_len] would grab the padding zeros from the left!
+                ids_i = input_ids[i][mask_i]  # (valid_len,) — only actual tokens
+                valid_len = ids_i.shape[0]
+
+                # seq_ids: every token belongs to sequence 0
+                seq_ids_i = torch.zeros(valid_len, dtype=torch.long, device=ids_i.device)
+                pos_ids_i = torch.arange(valid_len, dtype=torch.long, device=ids_i.device)  # 1D
+
+                # Clear cache state from previous sample
+                cache_obj = None
+                if hasattr(self.actor_module, "cache"):
+                    cache_obj = self.actor_module.cache
+                elif hasattr(self.actor_module, "module") and hasattr(self.actor_module.module, "cache"):
+                    cache_obj = self.actor_module.module.cache
+                if cache_obj is not None:
+                    cache_obj.clear()
+
+                output = self.actor_module(
+                    input_ids=ids_i,
+                    seq_ids=seq_ids_i,
+                    position_ids=pos_ids_i,
+                )
+
+                logits = output.logits.squeeze(0)  # (valid_len, vocab_size)
+                logits = logits / temperature
+
+                # Shift: predict next token
+                # ids_i is already the valid tokens (no padding)
+                shifted_ids = ids_i[1:]  # next token ids
+                shifted_logits = logits[:-1]  # logits predicting each next token
+
+                log_probs_i = logprobs_from_logits(logits=shifted_logits, labels=shifted_ids)
+
+                # Extract only the response logprobs
+                # ids_i = [prompt_tokens..., response_tokens...]
+                # log_probs_i has valid_len-1 entries (shifted)
+                # response starts at position (valid_len - response_length) in ids_i
+                # In log_probs_i (shifted), response logprobs start at (valid_len - response_length - 1)
+                prompt_token_count = valid_len - response_length
+                resp_start = max(0, prompt_token_count - 1)
+                resp_log_probs = log_probs_i[resp_start:]
+                # Pad to response_length
+                if resp_log_probs.shape[0] < response_length:
+                    pad = torch.zeros(
+                        response_length - resp_log_probs.shape[0],
+                        device=resp_log_probs.device,
+                        dtype=resp_log_probs.dtype,
+                    )
+                    resp_log_probs = torch.cat([resp_log_probs, pad])
+                else:
+                    resp_log_probs = resp_log_probs[:response_length]
+
+                all_log_probs.append(resp_log_probs)
+
+            log_probs = torch.stack(all_log_probs, dim=0)  # (bs, response_length)
+
+        result = {"log_probs": log_probs}
+        # veRL expects entropy when calculate_entropy=True
+        result["entropys"] = torch.zeros_like(log_probs)
+        return result
 
     @GPUMemoryLogger(role="dp actor", logger=logger)
     def compute_log_prob(self, data: DataProto, calculate_entropy: bool = False) -> dict[str, torch.Tensor]:

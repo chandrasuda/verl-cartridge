@@ -533,10 +533,14 @@ class AgentLoopWorker:
 
         # TODO(wuxibin): remove padding and use tensordict.
         self.tokenizer.padding_side = "left"
+        # Truncate prompt to max_length if it exceeds (e.g., chat template adds tokens)
+        max_prompt_len = self.config.actor_rollout_ref.rollout.prompt_length
+        if len(output.prompt_ids) > max_prompt_len:
+            output.prompt_ids = output.prompt_ids[-max_prompt_len:]  # keep the last max_prompt_len tokens (left truncation)
         prompt_output = self.tokenizer.pad(
             {"input_ids": output.prompt_ids},
             padding="max_length",
-            max_length=self.config.actor_rollout_ref.rollout.prompt_length,
+            max_length=max_prompt_len,
             return_tensors="pt",
             return_attention_mask=True,
         )
