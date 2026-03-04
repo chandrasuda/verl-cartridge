@@ -1,17 +1,16 @@
 """
 Quick 5-step speed test for on-policy cartridge training.
-Measures per-step time to estimate total training duration.
+Runs the actual training loop for 5 steps and reports timing.
 """
 import modal
+import time
 
 TOKASAURUS_URL = "https://kiran1234c--tokasaurus-cartridge-server-serve.modal.run"
 GPU = "A100-80GB"
 
+# Same image as modal_train.py
 image = (
-    modal.Image.from_registry(
-        "nvidia/cuda:12.4.1-devel-ubuntu22.04",
-        add_python="3.12",
-    )
+    modal.Image.from_registry("nvidia/cuda:12.4.1-devel-ubuntu22.04", add_python="3.12")
     .apt_install("git", "patch")
     .env({
         "CUDA_HOME": "/usr/local/cuda",
@@ -26,27 +25,25 @@ image = (
     .run_commands(
         "git clone https://github.com/HazyResearch/cartridges.git /opt/cartridges && pip install -e /opt/cartridges"
     )
-    .run_commands(
-        "git clone https://github.com/chandrasuda/verl-cartridge.git /opt/verl-cartridge "
-        "&& pip install -e /opt/verl-cartridge"
-    )
-    .run_commands(
-        "pip install git+https://github.com/chandrasuda/tokasaurus.git@geoff/cartridges"
-    )
+    .run_commands("pip install git+https://github.com/volcengine/verl.git")
+    .run_commands("pip install git+https://github.com/chandrasuda/tokasaurus.git@geoff/cartridges")
     .pip_install("requests")
-    .run_commands("echo 'speed-test-v2'")
+    .run_commands(
+        "python3 -c \""
+        "import urllib.request, zipfile, shutil, os; "
+        "urllib.request.urlretrieve("
+        "'https://github.com/chandrasuda/on-policy-cartridge-training/archive/refs/heads/main.zip', "
+        "'/tmp/p.zip'); "
+        "zipfile.ZipFile('/tmp/p.zip').extractall('/opt/'); "
+        "shutil.move('/opt/on-policy-cartridge-training-main', '/opt/patches'); "
+        "os.remove('/tmp/p.zip'); "
+        "print(os.listdir('/opt/patches/verl_patches/'))"
+        "\""
+    )
     .pip_install(
-        "transformers==4.53.0",
-        "ray[default]",
-        "omegaconf",
-        "hydra-core",
-        "pandas",
-        "pyarrow",
-        "aiohttp",
-        "codetiming",
-        "torchdata",
-        "peft",
-        "cachetools",
+        "transformers==4.53.0", "ray[default]", "omegaconf", "hydra-core",
+        "pandas", "pyarrow", "aiohttp", "codetiming", "torchdata", "peft",
+        "cachetools", "datasets", "tiktoken",
     )
 )
 
@@ -56,67 +53,68 @@ app = modal.App("speed-test", image=image)
 @app.function(
     gpu=GPU,
     secrets=[modal.Secret.from_name("huggingface-secret")],
-    timeout=3600,  # 1 hour max
+    timeout=3600,
 )
 def test_speed():
-    import subprocess
-    import os
-    import sys
-    import time
+    import subprocess, os, sys, json, time
 
-    # Verify GPU
-    import torch
-    props = torch.cuda.get_device_properties(0)
-    vram = getattr(props, 'total_memory', getattr(props, 'total_mem', 0))
-    print(f"GPU: {torch.cuda.get_device_name(0)}, VRAM: {vram / 1e9:.1f} GB")
-
-    # Verify our fork is installed (has CartridgeConfig)
-    from verl.workers.config.actor import CartridgeConfig
-    print(f"✓ CartridgeConfig available: {CartridgeConfig}")
+    # 1. Apply veRL patches (same as modal_train.py)
     import verl
     verl_path = os.path.dirname(os.path.dirname(verl.__file__))
-    print(f"veRL path: {verl_path}")
+    print(f"veRL installed at: {verl_path}")
 
-    # Create dummy reward function
-    os.makedirs("/tmp/reward", exist_ok=True)
-    with open("/tmp/reward/dummy_reward.py", "w") as f:
-        f.write("""
-def compute_score(data_source, solution_str, ground_truth, extra_info=None):
-    return 0.0
-""")
-    print("✓ Created dummy reward")
+    patches_dir = "/opt/patches/verl_patches"
+    for patch_file in sorted(os.listdir(patches_dir)):
+        if patch_file.endswith(".patch"):
+            patch_path = os.path.join(patches_dir, patch_file)
+            print(f"Applying {patch_file}...")
+            r = subprocess.run(
+                ["patch", "-p1", "--forward", "--reject-file=-", "-d", verl_path, "-i", patch_path],
+                capture_output=True, text=True,
+            )
+            if r.returncode == 0:
+                print(f"  ✓ Applied")
+            elif "already applied" in r.stdout.lower() or "reversed" in r.stdout.lower():
+                print(f"  ✓ Already applied")
+            else:
+                print(f"  ⚠ patch returned {r.returncode}: {r.stdout[:200]} {r.stderr[:200]}")
 
-    # Create minimal training data (just 200 prompts for the speed test)
+    # Also apply our local changes (top-k CE, KVFromText fix, checkpoint saving)
+    # These are in our forked verl, not in the patches repo
+    # For the speed test, the patches from the repo should be sufficient
+
+    # 2. Create minimal training data (just 200 prompts for the speed test)
     os.makedirs("/root/data/cartridge_distill", exist_ok=True)
     import pandas as pd
-
     prompts = []
     for i in range(200):
         prompts.append({
-            "prompt": [
-                {"role": "user", "content": f"What is the diagnosis for patient {i % 10 + 1}? Explain in detail."}
-            ],
+            "prompt": [{"role": "user", "content": f"Question {i}: What is the diagnosis for a patient with chest pain?"}],
             "patient_id": f"patient_{(i % 10) + 1:02d}",
-            "data_source": "longhealth",
-            "reward_model": {"ground_truth": ""},
         })
-
     df = pd.DataFrame(prompts)
     df.to_parquet("/root/data/cartridge_distill/train.parquet")
     df[:20].to_parquet("/root/data/cartridge_distill/val.parquet")
     print(f"Created {len(df)} training prompts")
 
-    # Prepare LongHealth data for teacher document lookup
+    # 3. Write dummy reward
+    os.makedirs("/tmp/reward", exist_ok=True)
+    with open("/tmp/reward/dummy_reward.py", "w") as f:
+        f.write("def compute_score(data_source, solution_str, ground_truth, extra_info=None):\n    return 0.0\n")
+
+    # 4. Prepare LongHealth data (for teacher document lookup)
     import requests as req
     url = "https://raw.githubusercontent.com/kbressem/LongHealth/refs/heads/main/data/benchmark_v5.json"
-    data = req.get(url).json()
-    import json
-    with open('/tmp/longhealth_data.json', 'w') as f:
-        json.dump(data, f)
-    print(f'LongHealth: {len(data)} patients')
+    r = req.get(url)
+    with open("/tmp/longhealth_data.json", "w") as f:
+        json.dump(r.json(), f)
+    print(f"Downloaded LongHealth data ({len(r.json())} patients)")
 
+    # 5. Run 5 steps
     env = os.environ.copy()
-    env["LONGHEALTH_DATA_PATH"] = "/tmp/longhealth_data.json"
+    env["HYDRA_FULL_ERROR"] = "1"
+    env["NCCL_DEBUG"] = "WARN"
+    env["TOKENIZERS_PARALLELISM"] = "false"
 
     cmd = [
         sys.executable, "-m", "verl.trainer.main_ppo",
@@ -125,12 +123,10 @@ def compute_score(data_source, solution_str, ground_truth, extra_info=None):
         "data.val_files=/root/data/cartridge_distill/val.parquet",
         "data.train_batch_size=32",
         "data.max_prompt_length=512",
-        "data.max_response_length=512",
+        "data.max_response_length=256",  # shorter for speed
         "data.filter_overlong_prompts=True",
-        #
-        f"actor_rollout_ref.model.path=meta-llama/Llama-3.2-3B-Instruct",
+        "actor_rollout_ref.model.path=meta-llama/Llama-3.2-3B-Instruct",
         "actor_rollout_ref.model.enable_gradient_checkpointing=True",
-        #
         "actor_rollout_ref.actor.strategy=fsdp",
         "actor_rollout_ref.actor.ppo_mini_batch_size=32",
         "actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=1",
@@ -147,23 +143,18 @@ def compute_score(data_source, solution_str, ground_truth, extra_info=None):
         "+actor_rollout_ref.actor.cartridge.num_tokens=2048",
         "+actor_rollout_ref.actor.cartridge.num_frozen_tokens=1",
         "+actor_rollout_ref.actor.cartridge.lr=0.02",
-        #
         "actor_rollout_ref.rollout.name=tokasaurus",
         "actor_rollout_ref.rollout.temperature=0.7",
-        "actor_rollout_ref.rollout.tensor_model_parallel_size=1",
         "actor_rollout_ref.rollout.n=1",
         "actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=4",
         "actor_rollout_ref.rollout.agent.num_workers=1",
         f"+actor_rollout_ref.rollout.custom.tokasaurus_url={TOKASAURUS_URL}",
         "+actor_rollout_ref.rollout.custom.cartridges=[]",
-        #
         "actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=4",
         "actor_rollout_ref.ref.fsdp_config.param_offload=True",
-        #
         "algorithm.use_kl_in_reward=False",
         "reward.custom_reward_function.path=/tmp/reward/dummy_reward.py",
         "reward.custom_reward_function.name=compute_score",
-        #
         "trainer.critic_warmup=0",
         'trainer.logger=["console"]',
         "trainer.project_name=speed_test",
@@ -174,31 +165,36 @@ def compute_score(data_source, solution_str, ground_truth, extra_info=None):
         "trainer.test_freq=-1",
         "trainer.default_local_dir=/tmp/speed_test",
         "trainer.total_epochs=100",
-        "trainer.total_training_steps=5",  # JUST 5 STEPS
+        "trainer.total_training_steps=5",
         "trainer.val_before_train=False",
     ]
 
     print(f"\n{'='*60}")
-    print(f"SPEED TEST: 5 steps, batch=32")
+    print("LAUNCHING 5-STEP SPEED TEST")
     print(f"Tokasaurus: {TOKASAURUS_URL}")
     print(f"{'='*60}\n")
 
-    start = time.time()
+    t0 = time.time()
     result = subprocess.run(cmd, env=env)
-    elapsed = time.time() - start
+    elapsed = time.time() - t0
+
+    per_step = elapsed / 5
+    eta_1000 = 1000 * per_step / 3600
 
     print(f"\n{'='*60}")
     print(f"SPEED TEST RESULTS")
+    print(f"  Exit code: {result.returncode}")
     print(f"  Total time: {elapsed:.0f}s ({elapsed/60:.1f} min)")
-    print(f"  Per-step (avg): {elapsed/5:.1f}s")
-    print(f"  2700 steps ETA: {elapsed/5 * 2700 / 3600:.1f} hours")
-    print(f"  Cost @ $3.73/hr A100 + $1.10/hr A10G: ${elapsed/5 * 2700 / 3600 * 4.83:.0f}")
+    print(f"  Per-step (incl. init): {per_step:.0f}s")
+    print(f"  1000 steps ETA: {eta_1000:.1f} hours")
+    print(f"  Cost @ $3.73/hr actor + $2.78/hr toka: ${eta_1000 * (3.73 + 2.78):.0f}")
     print(f"{'='*60}")
 
     return {
-        "total_time_sec": elapsed,
-        "per_step_sec": elapsed / 5,
-        "eta_2700_steps_hours": elapsed / 5 * 2700 / 3600,
+        "exit_code": result.returncode,
+        "total_sec": elapsed,
+        "per_step_sec": per_step,
+        "eta_1000_hours": eta_1000,
     }
 
 

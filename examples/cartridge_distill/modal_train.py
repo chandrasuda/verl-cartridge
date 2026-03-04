@@ -22,7 +22,7 @@ image = (
     .apt_install("git", "patch")
     .env({
         "CUDA_HOME": "/usr/local/cuda",
-        "CARTRIDGES_DIR": "/opt/cartridges/cartridges",
+        "CARTRIDGES_DIR": "/opt/cartridges",
         "CARTRIDGES_OUTPUT_DIR": "/tmp/cartridge_output",
     })
     .pip_install("torch==2.6.0", "packaging", "numpy")
