@@ -23,7 +23,7 @@ Usage:
 import modal
 
 MODEL = "meta-llama/Llama-3.2-3B-Instruct"
-GPU = "A10G"  # ~24 GB VRAM. Use "A100" for bigger models.
+GPU = "A100-40GB"  # A100 for fast batched generation during on-policy training
 PORT = 10210
 HF_CACHE = "/root/.cache/huggingface"
 
@@ -94,7 +94,7 @@ app = modal.App("tokasaurus-cartridge-server", image=image)
 @app.function(
     gpu=GPU,
     secrets=[modal.Secret.from_name("huggingface-secret")],
-    timeout=3600,
+    timeout=86400,  # 24 hours — on-policy training runs for 15+ hours
     # Scale to zero when idle — no GPU waste.
     # max_containers=1 prevents runaway auto-scaling (was hitting 10 GPUs).
     min_containers=0,

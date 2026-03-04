@@ -73,18 +73,18 @@ image = (
     )
 )
 
-cartridge_volume = modal.Volume.from_name("cartridge-checkpoints", create_if_missing=True)
-app = modal.App("cartridge-training", image=image)
+results_volume = modal.Volume.from_name("onpolicy-results", create_if_missing=True)
+app = modal.App("onpolicy-training", image=image)
 
 
 @app.function(
     gpu=GPU,
     secrets=[modal.Secret.from_name("huggingface-secret")],
-    timeout=7200,  # 2 hours
+    timeout=86400,  # 24 hours
     min_containers=0,
     max_containers=1,
     scaledown_window=600,
-    volumes={"/cartridge_output": cartridge_volume},
+    volumes={"/results": results_volume},
 )
 def train():
     """Run cartridge distillation training."""
@@ -188,7 +188,7 @@ print(f'Saved LongHealth data ({len(data)} patients) to /tmp/longhealth_data.jso
         #
         "data.train_files=/root/data/cartridge_distill/train.parquet",
         "data.val_files=/root/data/cartridge_distill/val.parquet",
-        "data.train_batch_size=8",
+        "data.train_batch_size=32",
         "data.max_prompt_length=512",
         "data.max_response_length=512",
         "data.filter_overlong_prompts=True",
@@ -199,7 +199,7 @@ print(f'Saved LongHealth data ({len(data)} patients) to /tmp/longhealth_data.jso
         "actor_rollout_ref.model.enable_gradient_checkpointing=True",
         #
         "actor_rollout_ref.actor.strategy=fsdp",
-        "actor_rollout_ref.actor.ppo_mini_batch_size=8",
+        "actor_rollout_ref.actor.ppo_mini_batch_size=32",
         "actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=1",
         "actor_rollout_ref.actor.use_kl_loss=True",
         "actor_rollout_ref.actor.kl_loss_coef=1.0",
@@ -211,8 +211,9 @@ print(f'Saved LongHealth data ({len(data)} patients) to /tmp/longhealth_data.jso
         "actor_rollout_ref.actor.fsdp_config.use_orig_params=True",
         "actor_rollout_ref.ref.fsdp_config.model_dtype=bfloat16",
         "+actor_rollout_ref.actor.cartridge.enabled=True",
-        "+actor_rollout_ref.actor.cartridge.checkpoint_path=hazyresearch/cartridge-wauoq23f",
+        # No checkpoint_path → KVFromText init (same as off-policy baseline)
         "+actor_rollout_ref.actor.cartridge.num_tokens=2048",
+        "+actor_rollout_ref.actor.cartridge.num_frozen_tokens=1",
         "+actor_rollout_ref.actor.cartridge.lr=0.02",
         #
         "actor_rollout_ref.rollout.name=tokasaurus",
@@ -221,7 +222,8 @@ print(f'Saved LongHealth data ({len(data)} patients) to /tmp/longhealth_data.jso
         "actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=4",
         "actor_rollout_ref.rollout.agent.num_workers=1",
         f"+actor_rollout_ref.rollout.custom.tokasaurus_url={TOKASAURUS_URL}",
-        "+actor_rollout_ref.rollout.custom.cartridges=[{id: hazyresearch/cartridge-wauoq23f, source: huggingface}]",
+        # Cartridge synced from actor after each step (no pre-loaded cartridge)
+        "+actor_rollout_ref.rollout.custom.cartridges=[]",
         #
         "actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=4",
         "actor_rollout_ref.ref.fsdp_config.param_offload=True",
@@ -237,11 +239,13 @@ print(f'Saved LongHealth data ({len(data)} patients) to /tmp/longhealth_data.jso
         "trainer.experiment_name=longhealth_llama3b_onpolicy",
         "trainer.n_gpus_per_node=1",
         "trainer.nnodes=1",
-        "trainer.save_freq=-1",  # Disable checkpointing (CacheAndModel missing .config attr)
-        "trainer.test_freq=5",
-        "trainer.total_epochs=2",
+        "trainer.save_freq=-1",  # Disable full-model checkpointing (CacheAndModel missing .config)
+        "trainer.test_freq=-1",  # Disable reward-based test (dummy reward = useless)
+        "+trainer.cartridge_save_freq=128",  # Save cache .pt every 128 steps (matches off-policy eval freq)
+        "trainer.default_local_dir=/results/onpolicy",
+        "trainer.total_epochs=100",  # Large — actual limit is total_training_steps below
+        "trainer.total_training_steps=2700",  # Match off-policy (~2694 steps)
         "trainer.val_before_train=False",
-        "trainer.test_freq=-1",
     ]
 
     print(f"\n{'='*60}")

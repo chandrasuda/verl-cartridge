@@ -1,94 +1,143 @@
 #!/usr/bin/env python3
 """
-Prepare LongHealth patient questions as veRL training data.
+Prepare on-policy training data from the SAME prompts the off-policy baseline uses.
 
-Downloads the LongHealth benchmark, formats the questions as prompts,
-and saves them as parquet files that veRL's data pipeline can read.
+Extracts the user-turn prompts from the paper's 196K synthesized HuggingFace data
+and formats them as veRL parquet files. This ensures both methods train on the
+exact same question distribution — the only difference is who generates the answers.
 
 Usage:
-    python examples/cartridge_distill/prepare_data.py
+    # Requires CARTRIDGES_DIR and CARTRIDGES_OUTPUT_DIR set, or:
+    CARTRIDGES_DIR=/opt/cartridges CARTRIDGES_OUTPUT_DIR=/tmp \
+        python examples/cartridge_distill/prepare_data.py
 
 Output:
-    ~/data/cartridge_distill/train.parquet
-    ~/data/cartridge_distill/val.parquet
+    ~/data/cartridge_distill/train.parquet   (from shards 0+1, ~130K prompts)
+    ~/data/cartridge_distill/val.parquet     (from shard 2, ~65K prompts, or small subset)
 """
 
 import json
 import os
+import re
 from pathlib import Path
 
 import pandas as pd
-import requests
 
 
-def load_longhealth():
-    """Download and parse the LongHealth benchmark.
+# ---------- patient name → patient_id mapping (for teacher document lookup) ----------
+PATIENT_NAMES = {}  # filled lazily
 
-    Each row includes:
-      - prompt: the question in chat format (for the student rollout)
-      - document_text: the full patient documents (for the teacher context)
-      - patient_id, correct_answer: metadata
-    """
+
+def _load_patient_mapping():
+    """Build patient_name → patient_id mapping from LongHealth benchmark."""
+    global PATIENT_NAMES
+    if PATIENT_NAMES:
+        return
+    import requests
+
     url = "https://raw.githubusercontent.com/kbressem/LongHealth/refs/heads/main/data/benchmark_v5.json"
-    print(f"Downloading LongHealth from {url}...")
-    data = requests.get(url).json()
+    print(f"Downloading LongHealth metadata from {url}...")
+    data = requests.get(url, timeout=30).json()
+    for pid, patient in data.items():
+        PATIENT_NAMES[patient["name"]] = pid
+    print(f"Loaded {len(PATIENT_NAMES)} patient names")
+
+
+def _extract_patient_id_from_prompt(prompt_text: str) -> str:
+    """Try to match a patient name in the prompt to get the patient_id."""
+    _load_patient_mapping()
+    for name, pid in PATIENT_NAMES.items():
+        if name in prompt_text:
+            return pid
+    return "unknown"
+
+
+# ---------- HF data extraction ----------
+
+def extract_prompts_from_hf_shard(repo_id: str, limit: int = None) -> list[dict]:
+    """Download one HF shard and extract user-turn prompts.
+
+    Each conversation in the paper's data is [user, assistant].
+    We take the user message as the prompt for on-policy rollout.
+    """
+    # Use datasets + huggingface_hub to download
+    from huggingface_hub import HfApi
+    import pyarrow.parquet as pq
+    import io
+    import requests
+
+    api = HfApi()
+    repo_files = api.list_repo_files(repo_id, repo_type="dataset")
+    parquet_files = sorted(f for f in repo_files if f.startswith("data/") and f.endswith(".parquet"))
+
+    if not parquet_files:
+        raise ValueError(f"No parquet files in {repo_id}")
 
     prompts = []
-    for patient_id, patient in data.items():
-        name = patient["name"]
-        diagnosis = patient["diagnosis"]
-        birthday = patient["birthday"]
+    for pf in parquet_files:
+        url = f"https://huggingface.co/datasets/{repo_id}/resolve/main/{pf}"
+        print(f"  Downloading {pf}...")
+        resp = requests.get(url, timeout=120)
+        resp.raise_for_status()
+        table = pq.read_table(io.BytesIO(resp.content))
+        df = table.to_pandas()
 
-        # Concatenate ALL patient documents into one string for teacher context
-        document_text = "\n\n".join(
-            f"--- {doc_id} ---\n{doc_text}"
-            for doc_id, doc_text in patient["texts"].items()
-        )
+        for _, row in df.iterrows():
+            messages = row.get("messages", [])
+            if not messages:
+                continue
 
-        for q in patient["questions"]:
-            options = (
-                f"A) {q['answer_a']}\n"
-                f"B) {q['answer_b']}\n"
-                f"C) {q['answer_c']}\n"
-                f"D) {q['answer_d']}\n"
-                f"E) {q['answer_e']}"
-            )
-            prompt = (
-                f"You are answering questions about a patient. "
-                f"Patient: {name}, DOB: {birthday}, Diagnosis: {diagnosis}.\n\n"
-                f"Question: {q['question']}\n\n"
-                f"Options:\n{options}\n\n"
-                f"Think step by step, then give your final answer."
-            )
+            # Find the first user message
+            user_content = None
+            for msg in messages:
+                role = msg.get("role", "")
+                if role == "user":
+                    user_content = msg.get("content", "")
+                    break
+
+            if not user_content:
+                continue
+
+            patient_id = _extract_patient_id_from_prompt(user_content)
+
             prompts.append({
-                "prompt": [{"role": "user", "content": prompt}],
-                "document_text": document_text,
-                "data_source": "longhealth",
+                "prompt": [{"role": "user", "content": user_content}],
+                "data_source": "longhealth_synthesized",
                 "patient_id": patient_id,
-                "correct_answer": q["correct"],
-                # veRL's reward loop expects this field
-                "reward_model": {"ground_truth": q["correct"], "style": "rule"},
+                # Dummy reward — distillation uses KL loss, not reward
+                "reward_model": {"ground_truth": "", "style": "rule"},
             })
+
+            if limit and len(prompts) >= limit:
+                return prompts
 
     return prompts
 
 
 def main():
-    prompts = load_longhealth()
-    print(f"Total prompts: {len(prompts)}")
+    # The paper's three HF shards (196K total conversations)
+    hf_shards = [
+        "hazyresearch/m07d11_longhealth_synthesize_llama-3.2-3b_p10_n65536-0",
+        "hazyresearch/m07d11_longhealth_synthesize_llama-3.2-3b_p10_n65536-1",
+        "hazyresearch/m07d11_longhealth_synthesize_llama-3.2-3b_p10_n65536-2",
+    ]
 
-    # Split: first 8 patients for train, last 2 for val
-    train = [p for p in prompts if int(p["patient_id"].split("_")[1]) <= 8]
-    val = [p for p in prompts if int(p["patient_id"].split("_")[1]) > 8]
-    print(f"Train: {len(train)}, Val: {len(val)}")
+    # Extract prompts from shards 0+1 for training, shard 2 for val
+    train_prompts = []
+    for shard in hf_shards[:2]:
+        print(f"\nExtracting prompts from {shard}...")
+        train_prompts.extend(extract_prompts_from_hf_shard(shard))
+    print(f"\nTotal train prompts: {len(train_prompts)}")
 
-    out_dir = Path.home() / "data" / "cartridge_distill"
+    print(f"\nExtracting prompts from {hf_shards[2]}...")
+    val_prompts = extract_prompts_from_hf_shard(hf_shards[2], limit=500)
+    print(f"Val prompts: {len(val_prompts)}")
+
+    out_dir = Path(os.environ.get("DATA_DIR", str(Path.home() / "data"))) / "cartridge_distill"
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # veRL expects parquet with at minimum a "prompt" column
-    # prompt should be a list of message dicts (chat format)
-    train_df = pd.DataFrame(train)
-    val_df = pd.DataFrame(val)
+    train_df = pd.DataFrame(train_prompts)
+    val_df = pd.DataFrame(val_prompts)
 
     train_path = out_dir / "train.parquet"
     val_path = out_dir / "val.parquet"

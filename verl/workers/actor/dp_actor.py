@@ -435,28 +435,32 @@ class DataParallelPPOActor(BasePPOActor):
         instead of (input_ids, attention_mask, position_ids).  We convert the
         attention_mask to seq_ids (all tokens belong to sequence 0) and call the
         wrapped model directly.
+
+        When ref_topk_ids is present in the micro_batch, also returns the student's
+        log-probs at the teacher's top-k positions (for top-k distillation loss).
         """
+        import torch.nn.functional as F
+
+        # Teacher top-k token IDs (if available for distillation)
+        ref_topk_ids = micro_batch.get("ref_topk_ids", None)  # (bs, resp_len, K) or None
+        TOP_K = ref_topk_ids.shape[-1] if ref_topk_ids is not None else 0
+
         with torch.autocast(device_type=self.device_name, dtype=self.param_dtype):
             input_ids = micro_batch["input_ids"]  # (bs, seqlen)
             batch_size, seqlen = input_ids.shape
             attention_mask = micro_batch["attention_mask"]
             position_ids = micro_batch["position_ids"]
 
-            # CacheAndModel / FlexLlamaForCausalLM expects 1D tensors (no batch dim).
-            # FlexLlama internally does unsqueeze(0) to add the batch dimension.
-            # Process each sample in the micro-batch independently.
             all_log_probs = []
+            all_student_topk = [] if TOP_K > 0 else None
+
             for i in range(batch_size):
-                mask_i = attention_mask[i].bool()  # (seqlen,)
-                # CRITICAL: use boolean mask, NOT [:valid_len].
-                # input_ids is LEFT-padded: [0,0,PAD,tok1,tok2,...,resp1,resp2,PAD,0]
-                # [:valid_len] would grab the padding zeros from the left!
-                ids_i = input_ids[i][mask_i]  # (valid_len,) — only actual tokens
+                mask_i = attention_mask[i].bool()
+                ids_i = input_ids[i][mask_i]  # (valid_len,)
                 valid_len = ids_i.shape[0]
 
-                # seq_ids: every token belongs to sequence 0
                 seq_ids_i = torch.zeros(valid_len, dtype=torch.long, device=ids_i.device)
-                pos_ids_i = torch.arange(valid_len, dtype=torch.long, device=ids_i.device)  # 1D
+                pos_ids_i = torch.arange(valid_len, dtype=torch.long, device=ids_i.device)
 
                 # Clear cache state from previous sample
                 cache_obj = None
@@ -473,42 +477,58 @@ class DataParallelPPOActor(BasePPOActor):
                     position_ids=pos_ids_i,
                 )
 
-                logits = output.logits.squeeze(0)  # (valid_len, vocab_size)
-                logits = logits / temperature
+                logits = output.logits.squeeze(0) / temperature  # (valid_len, vocab)
 
-                # Shift: predict next token
-                # ids_i is already the valid tokens (no padding)
-                shifted_ids = ids_i[1:]  # next token ids
-                shifted_logits = logits[:-1]  # logits predicting each next token
+                # Shift for next-token prediction
+                shifted_ids = ids_i[1:]
+                shifted_logits = logits[:-1]  # (valid_len-1, vocab)
 
                 log_probs_i = logprobs_from_logits(logits=shifted_logits, labels=shifted_ids)
 
-                # Extract only the response logprobs
-                # ids_i = [prompt_tokens..., response_tokens...]
-                # log_probs_i has valid_len-1 entries (shifted)
-                # response starts at position (valid_len - response_length) in ids_i
-                # In log_probs_i (shifted), response logprobs start at (valid_len - response_length - 1)
+                # Extract response portion
                 prompt_token_count = valid_len - response_length
                 resp_start = max(0, prompt_token_count - 1)
                 resp_log_probs = log_probs_i[resp_start:]
+
                 # Pad to response_length
                 if resp_log_probs.shape[0] < response_length:
                     pad = torch.zeros(
                         response_length - resp_log_probs.shape[0],
-                        device=resp_log_probs.device,
-                        dtype=resp_log_probs.dtype,
+                        device=resp_log_probs.device, dtype=resp_log_probs.dtype,
                     )
                     resp_log_probs = torch.cat([resp_log_probs, pad])
                 else:
                     resp_log_probs = resp_log_probs[:response_length]
-
                 all_log_probs.append(resp_log_probs)
+
+                # Top-k student logprobs at teacher's token positions
+                if TOP_K > 0:
+                    resp_logits = shifted_logits[resp_start:]  # (resp_actual, vocab)
+                    resp_actual = resp_logits.shape[0]
+                    log_probs_full = F.log_softmax(resp_logits, dim=-1)  # (resp_actual, vocab)
+
+                    topk_ids_i = ref_topk_ids[i]  # (response_length, K)
+                    # Gather student logprobs at teacher's top-k positions
+                    actual_len = min(resp_actual, response_length)
+                    student_topk_i = log_probs_full[:actual_len].gather(
+                        -1, topk_ids_i[:actual_len].to(log_probs_full.device)
+                    )  # (actual_len, K)
+
+                    # Pad to response_length
+                    if actual_len < response_length:
+                        pad = torch.zeros(
+                            response_length - actual_len, TOP_K,
+                            device=student_topk_i.device, dtype=student_topk_i.dtype,
+                        )
+                        student_topk_i = torch.cat([student_topk_i, pad], dim=0)
+                    all_student_topk.append(student_topk_i)
 
             log_probs = torch.stack(all_log_probs, dim=0)  # (bs, response_length)
 
         result = {"log_probs": log_probs}
-        # veRL expects entropy when calculate_entropy=True
         result["entropys"] = torch.zeros_like(log_probs)
+        if all_student_topk is not None:
+            result["student_topk_logprobs"] = torch.stack(all_student_topk, dim=0)  # (bs, resp_len, K)
         return result
 
     @GPUMemoryLogger(role="dp actor", logger=logger)
@@ -616,6 +636,10 @@ class DataParallelPPOActor(BasePPOActor):
             select_keys.append("prompts")
         if self.config.use_kl_loss:
             select_keys.append("ref_log_prob")
+        # Top-k distillation tensors from teacher (if available)
+        if "ref_topk_logprobs" in data.batch.keys():
+            select_keys.append("ref_topk_logprobs")
+            select_keys.append("ref_topk_ids")
         # Include pre-computed IS weights if present in batch
         # Weights are computed centrally in trainer and added to batch when algorithm.rollout_is=True
         if "rollout_is_weights" in data.batch.keys():
@@ -735,12 +759,30 @@ class DataParallelPPOActor(BasePPOActor):
                             policy_loss -= entropy_agg * entropy_coeff
 
                     if self.config.use_kl_loss:
-                        ref_log_prob = model_inputs["ref_log_prob"]
-                        # compute kl loss
-                        kld = kl_penalty(
-                            logprob=log_prob, ref_logprob=ref_log_prob, kl_penalty=self.config.kl_loss_type
-                        )
-                        kl_loss = agg_loss(loss_mat=kld, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
+                        # Top-k cross-entropy distillation (matches the paper's loss)
+                        # when ref_topk_logprobs are available from the teacher
+                        student_topk = outputs.get("student_topk_logprobs", None)
+                        ref_topk_lp = model_inputs.get("ref_topk_logprobs", None)
+
+                        if student_topk is not None and ref_topk_lp is not None:
+                            # Paper's loss: CE = -Σ p_teacher(x) * log p_student(x) over top-k
+                            # student_topk: (bs, resp_len, K) — log probs
+                            # ref_topk_lp:  (bs, resp_len, K) — log probs
+                            teacher_probs = ref_topk_lp.exp()  # p_teacher(x)
+                            ce_per_token = -(teacher_probs * student_topk).sum(dim=-1)  # (bs, resp_len)
+                            kl_loss = agg_loss(
+                                loss_mat=ce_per_token, loss_mask=response_mask, loss_agg_mode=loss_agg_mode
+                            )
+                            micro_batch_metrics["actor/topk_ce"] = kl_loss.detach().item()
+                        else:
+                            # Fallback: single-token KL (backward compat)
+                            ref_log_prob = model_inputs["ref_log_prob"]
+                            kld = kl_penalty(
+                                logprob=log_prob, ref_logprob=ref_log_prob, kl_penalty=self.config.kl_loss_type
+                            )
+                            kl_loss = agg_loss(
+                                loss_mat=kld, loss_mask=response_mask, loss_agg_mode=loss_agg_mode
+                            )
 
                         policy_loss = policy_loss + kl_loss * self.config.kl_loss_coef
                         metrics["actor/kl_loss"] += kl_loss.detach().item() * loss_scale_factor

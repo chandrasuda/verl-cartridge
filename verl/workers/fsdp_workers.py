@@ -606,8 +606,12 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 cache = TrainableCache.from_pretrained(local_path)
             else:
                 if self.rank == 0:
-                    print(f"[cartridge] Initializing cache with {num_tokens} tokens via KVFromText")
-                initializer = KVFromText(max_tokens=num_tokens, num_frozen_tokens=num_frozen)
+                    print(f"[cartridge] Initializing cache with {num_tokens} tokens via KVFromText (frozen={num_frozen})")
+                kv_config = KVFromText.Config(max_tokens=num_tokens, num_frozen_tokens=num_frozen)
+                initializer = KVFromText(kv_config)
+                # KVFromText runs a forward pass → needs model on GPU
+                _device = get_device_id()
+                actor_module = actor_module.to(_device)
                 cache = initializer.initialize_kv_cache(
                     tokenizer=self.tokenizer, model=actor_module, attn_config=attn_config,
                 )
@@ -1343,6 +1347,8 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             load_fsdp_model_to_gpu(ref_model)
 
         all_ref_logprobs = []
+        all_topk_logprobs = []
+        all_topk_ids = []
         teacher_hits = 0
 
         with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
@@ -1388,34 +1394,50 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
                 logits = output.logits.squeeze(0) / temperature  # (ext_len, vocab)
 
-                # Extract response logprobs
-                # Response tokens are at the END of the extended sequence
-                # shifted by 1 for next-token prediction
+                # Extract response logits (shifted for next-token prediction)
                 doc_prompt_len = ext_len - valid_response_len
                 shifted_ids = ext_ids.squeeze(0)[doc_prompt_len:]  # response token ids
                 shifted_logits = logits[doc_prompt_len - 1:-1]  # logits predicting response tokens
 
+                TOP_K = 20  # match the paper's top_k_logits=20
+
                 if shifted_logits.shape[0] > 0 and shifted_ids.shape[0] > 0:
+                    # Single-token logprob (for the KL penalty path, backward compat)
                     resp_lp = logprobs_from_logits(logits=shifted_logits, labels=shifted_ids)
+
+                    # Top-k logprobs: the paper's distillation target
+                    log_probs_full = torch.nn.functional.log_softmax(shifted_logits, dim=-1)  # (resp_len, vocab)
+                    topk_lp, topk_ids = torch.topk(log_probs_full, k=TOP_K, dim=-1)  # each (resp_len, TOP_K)
                 else:
                     resp_lp = torch.zeros(valid_response_len, device=device)
+                    topk_lp = torch.zeros(valid_response_len, TOP_K, device=device)
+                    topk_ids = torch.zeros(valid_response_len, TOP_K, dtype=torch.long, device=device)
 
                 # Pad to response_length
-                if resp_lp.shape[0] < response_length:
-                    pad = torch.zeros(response_length - resp_lp.shape[0], device=device)
-                    resp_lp = torch.cat([resp_lp, pad])
-                else:
-                    resp_lp = resp_lp[:response_length]
+                def _pad_to(t, target_len, pad_val=0):
+                    if t.shape[0] < target_len:
+                        pad_shape = list(t.shape)
+                        pad_shape[0] = target_len - t.shape[0]
+                        t = torch.cat([t, torch.full(pad_shape, pad_val, dtype=t.dtype, device=t.device)])
+                    return t[:target_len]
 
-                all_ref_logprobs.append(resp_lp)
+                all_ref_logprobs.append(_pad_to(resp_lp, response_length))
+                all_topk_logprobs.append(_pad_to(topk_lp, response_length))
+                all_topk_ids.append(_pad_to(topk_ids, response_length))
 
-        ref_log_prob = torch.stack(all_ref_logprobs, dim=0).float().cpu()
+        ref_log_prob = torch.stack(all_ref_logprobs, dim=0).float().cpu()  # (bs, resp_len)
+        ref_topk_logprobs = torch.stack(all_topk_logprobs, dim=0).float().cpu()  # (bs, resp_len, 20)
+        ref_topk_ids = torch.stack(all_topk_ids, dim=0).long().cpu()  # (bs, resp_len, 20)
         print(f"[cartridge-ref] Teacher: {teacher_hits}/{batch_size} with docs, mean_lp={ref_log_prob[ref_log_prob != 0].mean():.4f}")
 
         if self._is_offload_param:
             offload_fsdp_model_to_cpu(ref_model)
 
-        output = DataProto.from_dict(tensors={"ref_log_prob": ref_log_prob})
+        output = DataProto.from_dict(tensors={
+            "ref_log_prob": ref_log_prob,
+            "ref_topk_logprobs": ref_topk_logprobs,
+            "ref_topk_ids": ref_topk_ids,
+        })
         output = output.to("cpu")
         return output
 

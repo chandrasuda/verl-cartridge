@@ -1669,6 +1669,20 @@ class RayPPOTrainer:
                             with marked_timer("cartridge_sync", timing_raw, color="yellow"):
                                 self._sync_cartridge_to_tokasaurus()
 
+                        # --- Cartridge checkpoint: save cache .pt for later eval ---
+                        if getattr(self, "_cartridge_sync_enabled", False):
+                            cartridge_save_freq = self.config.trainer.get("cartridge_save_freq", 128)
+                            if cartridge_save_freq > 0 and (
+                                is_last_step or self.global_steps % cartridge_save_freq == 0
+                            ):
+                                save_dir = os.path.join(
+                                    self.config.trainer.default_local_dir, "cartridge_checkpoints"
+                                )
+                                os.makedirs(save_dir, exist_ok=True)
+                                ckpt_path = os.path.join(save_dir, f"cache-step{self.global_steps}.pt")
+                                self.actor_rollout_wg.save_cartridge(ckpt_path)
+                                print(f"[cartridge] Saved checkpoint: {ckpt_path}")
+
                         actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                         metrics.update(actor_output_metrics)
 
