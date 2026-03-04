@@ -35,29 +35,17 @@ image = (
     .run_commands(
         "git clone https://github.com/HazyResearch/cartridges.git /opt/cartridges && pip install -e /opt/cartridges"
     )
-    # Install veRL
+    # Install veRL from our fork (has cartridge support baked in)
     .run_commands(
-        "pip install git+https://github.com/volcengine/verl.git"
+        "git clone https://github.com/chandrasuda/verl-cartridge.git /opt/verl-cartridge "
+        "&& pip install -e /opt/verl-cartridge"
     )
     # Install tokasaurus
     .run_commands(
         "pip install git+https://github.com/chandrasuda/tokasaurus.git@geoff/cartridges"
     )
     .pip_install("requests")
-    .run_commands("echo 'patch-version-8'")  # Force image rebuild to pick up latest patches
-    .run_commands(
-        "python3 -c \""
-        "import urllib.request, zipfile, shutil, os; "
-        "urllib.request.urlretrieve("
-        "'https://github.com/chandrasuda/on-policy-cartridge-training/archive/refs/heads/main.zip', "
-        "'/tmp/p.zip'); "
-        "zipfile.ZipFile('/tmp/p.zip').extractall('/opt/'); "
-        "shutil.move('/opt/on-policy-cartridge-training-main', '/opt/patches'); "
-        "os.remove('/tmp/p.zip'); "
-        "print(os.listdir('/opt/patches/verl_patches/'))"
-        "\""
-    )
-    # Remaining deps not covered by the above
+    .run_commands("echo 'fork-install-v1'")  # bump to force image rebuild
     .pip_install(
         "transformers==4.53.0",
         "ray[default]",
@@ -102,81 +90,27 @@ def train():
     except Exception as e:
         print(f"GPU check failed: {e}")
 
-    # First, apply the veRL patches
-    # Find where veRL is installed
-    import verl
-    verl_path = os.path.dirname(os.path.dirname(verl.__file__))
-    print(f"veRL installed at: {verl_path}")
+    # Verify our fork is installed correctly
+    from verl.workers.config.actor import CartridgeConfig
+    print(f"✓ veRL fork installed with CartridgeConfig")
 
-    # Patches baked into image at /opt/patches
-    import shutil
-    print(f"✓ Patches at /opt/patches: {os.listdir('/opt/patches/verl_patches/')}")
-
-    # Copy the tokasaurus rollout bridge
-    toka_dst = os.path.join(verl_path, "verl", "workers", "rollout", "tokasaurus_rollout")
-    toka_src = "/opt/patches/verl_patches/rollout/tokasaurus_rollout"
-    if os.path.exists(toka_dst):
-        shutil.rmtree(toka_dst)
-    shutil.copytree(toka_src, toka_dst)
-    print(f"Copied tokasaurus_rollout to {toka_dst}")
-
-    # Apply patches by directly overwriting files in the installed veRL package.
-    # git apply doesn't work on pip-installed site-packages (no .git).
-    # Instead, we use a Python script that reads the patch and applies edits.
-    import importlib
-    import verl.workers.config.actor as actor_mod
-    import verl.workers.actor.dp_actor as dp_actor_mod
-    import verl.workers.rollout.replica as replica_mod
-    import verl.workers.fsdp_workers as fsdp_mod
-    import verl.trainer.ppo.ray_trainer as trainer_mod
-
-    # For each patched file, copy our pre-patched version from the workspace
-    # We keep full patched copies in the repo for this purpose
-    patch_script = "/tmp/patches/apply_patches.py"
-    subprocess.run([sys.executable, "-c", f"""
-import subprocess, sys
-# Apply patches using the `patch` command directly on the installed files
-import verl, os
-sp = os.path.dirname(os.path.dirname(verl.__file__))
-
-patches = [
-    ('config/actor_config.patch', 'verl/workers/config/actor.py'),
-    ('actor/dp_actor.patch', 'verl/workers/actor/dp_actor.py'),
-    ('rollout/replica.patch', 'verl/workers/rollout/replica.py'),
-    ('fsdp_workers.patch', 'verl/workers/fsdp_workers.py'),
-    ('ray_trainer.patch', 'verl/trainer/ppo/ray_trainer.py'),
-    ('rollout/base.patch', 'verl/workers/rollout/base.py'),
-    ('agent_loop.patch', 'verl/experimental/agent_loop/agent_loop.py'),
-]
-for patch_name, target in patches:
-    patch_path = f'/opt/patches/verl_patches/{{patch_name}}'
-    target_path = os.path.join(sp, target)
-    if not os.path.exists(target_path):
-        print(f'⚠ Target not found: {{target_path}}')
-        continue
-    r = subprocess.run(['patch', '-p1', '--forward', '-i', patch_path, target_path],
-                       capture_output=True, text=True)
-    if r.returncode == 0:
-        print(f'✓ Patched {{target}}')
-    elif 'already applied' in r.stdout or 'Reversed' in r.stdout:
-        print(f'✓ Already patched {{target}}')
-    else:
-        print(f'⚠ Failed to patch {{target}}: {{r.stderr[:200]}}')
-"""], check=False)
-
-    # Prepare data
+    # Prepare training data (extract prompts from paper's HF data)
     subprocess.run([
-        sys.executable, "/opt/patches/training/prepare_data.py"
+        sys.executable, "/opt/verl-cartridge/examples/cartridge_distill/prepare_data.py"
     ], check=True)
 
-    # Pre-download LongHealth data for the teacher (ref worker may not have HTTP access)
-    subprocess.run([sys.executable, "-c", """
-import requests, json
-data = requests.get('https://raw.githubusercontent.com/kbressem/LongHealth/refs/heads/main/data/benchmark_v5.json').json()
-with open('/tmp/longhealth_data.json', 'w') as f:
-    json.dump(data, f)
-print(f'Saved LongHealth data ({len(data)} patients) to /tmp/longhealth_data.json')
-"""], check=True)
+    # Pre-download LongHealth data for the teacher
+    import requests as req
+    data = req.get('https://raw.githubusercontent.com/kbressem/LongHealth/refs/heads/main/data/benchmark_v5.json').json()
+    import json
+    with open('/tmp/longhealth_data.json', 'w') as f:
+        json.dump(data, f)
+    print(f'Saved LongHealth data ({len(data)} patients) to /tmp/longhealth_data.json')
+
+    # Create dummy reward function (cartridge uses KL loss, not rewards)
+    os.makedirs("/tmp/reward", exist_ok=True)
+    with open("/tmp/reward/dummy_reward.py", "w") as f:
+        f.write("def compute_score(data_source, solution_str, ground_truth, extra_info=None):\\n    return 0.0\\n")
 
     # Run training
     env = os.environ.copy()
@@ -230,7 +164,7 @@ print(f'Saved LongHealth data ({len(data)} patients) to /tmp/longhealth_data.jso
         #
         "algorithm.use_kl_in_reward=False",
         # Dummy reward (cartridge distillation uses KL loss, not reward-based RL)
-        "reward.custom_reward_function.path=/opt/patches/training/dummy_reward.py",
+        "reward.custom_reward_function.path=/tmp/reward/dummy_reward.py",
         "reward.custom_reward_function.name=compute_score",
         #
         "trainer.critic_warmup=0",

@@ -27,25 +27,13 @@ image = (
         "git clone https://github.com/HazyResearch/cartridges.git /opt/cartridges && pip install -e /opt/cartridges"
     )
     .run_commands(
-        "pip install git+https://github.com/volcengine/verl.git"
+        "pip install git+https://github.com/chandrasuda/verl-cartridge.git@main"
     )
     .run_commands(
         "pip install git+https://github.com/chandrasuda/tokasaurus.git@geoff/cartridges"
     )
     .pip_install("requests")
-    .run_commands("echo 'speed-test-v1'")
-    .run_commands(
-        "python3 -c \""
-        "import urllib.request, zipfile, shutil, os; "
-        "urllib.request.urlretrieve("
-        "'https://github.com/chandrasuda/on-policy-cartridge-training/archive/refs/heads/main.zip', "
-        "'/tmp/p.zip'); "
-        "zipfile.ZipFile('/tmp/p.zip').extractall('/opt/'); "
-        "shutil.move('/opt/on-policy-cartridge-training-main', '/opt/patches'); "
-        "os.remove('/tmp/p.zip'); "
-        "print(os.listdir('/opt/patches/verl_patches/'))"
-        "\""
-    )
+    .run_commands("echo 'speed-test-v2'")
     .pip_install(
         "transformers==4.53.0",
         "ray[default]",
@@ -81,27 +69,21 @@ def test_speed():
     vram = getattr(props, 'total_memory', getattr(props, 'total_mem', 0))
     print(f"GPU: {torch.cuda.get_device_name(0)}, VRAM: {vram / 1e9:.1f} GB")
 
-    # Apply patches (same as modal_train.py)
+    # Verify our fork is installed (has CartridgeConfig)
+    from verl.workers.config.actor import CartridgeConfig
+    print(f"✓ CartridgeConfig available: {CartridgeConfig}")
     import verl
     verl_path = os.path.dirname(os.path.dirname(verl.__file__))
     print(f"veRL path: {verl_path}")
 
-    patches_dir = "/opt/patches/verl_patches"
-    for patch_name in sorted(os.listdir(patches_dir)):
-        if patch_name.endswith(".patch"):
-            patch_path = os.path.join(patches_dir, patch_name)
-            print(f"Applying {patch_name}...")
-            result = subprocess.run(
-                ["patch", "-p1", "-d", verl_path, "-i", patch_path, "--forward"],
-                capture_output=True, text=True,
-            )
-            if result.returncode == 0:
-                print(f"  ✓ Applied")
-            else:
-                if "already applied" in result.stdout or "Reversed" in result.stdout:
-                    print(f"  ⊘ Already applied")
-                else:
-                    print(f"  ✗ Failed: {result.stderr[:200]}")
+    # Create dummy reward function
+    os.makedirs("/tmp/reward", exist_ok=True)
+    with open("/tmp/reward/dummy_reward.py", "w") as f:
+        f.write("""
+def compute_score(data_source, solution_str, ground_truth, extra_info=None):
+    return 0.0
+""")
+    print("✓ Created dummy reward")
 
     # Create minimal training data (just 200 prompts for the speed test)
     os.makedirs("/root/data/cartridge_distill", exist_ok=True)
@@ -175,7 +157,7 @@ def test_speed():
         "actor_rollout_ref.ref.fsdp_config.param_offload=True",
         #
         "algorithm.use_kl_in_reward=False",
-        "reward.custom_reward_function.path=/opt/patches/training/dummy_reward.py",
+        "reward.custom_reward_function.path=/tmp/reward/dummy_reward.py",
         "reward.custom_reward_function.name=compute_score",
         #
         "trainer.critic_warmup=0",
