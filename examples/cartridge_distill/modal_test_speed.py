@@ -133,7 +133,7 @@ def compute_score(data_source, solution_str, ground_truth, extra_info=None):
         #
         "actor_rollout_ref.actor.strategy=fsdp",
         "actor_rollout_ref.actor.ppo_mini_batch_size=32",
-        "actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=1",
+        "actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=8",
         "actor_rollout_ref.actor.use_kl_loss=True",
         "actor_rollout_ref.actor.kl_loss_coef=1.0",
         "actor_rollout_ref.actor.kl_loss_type=low_var_kl",

@@ -11,7 +11,7 @@ GPU = "A100-80GB"
 # Same image as modal_train.py
 image = (
     modal.Image.from_registry("nvidia/cuda:12.4.1-devel-ubuntu22.04", add_python="3.12")
-    .apt_install("git", "patch")
+    .apt_install("git")
     .env({
         "CUDA_HOME": "/usr/local/cuda",
         "CARTRIDGES_DIR": "/opt/cartridges",
@@ -25,26 +25,18 @@ image = (
     .run_commands(
         "git clone https://github.com/HazyResearch/cartridges.git /opt/cartridges && pip install -e /opt/cartridges"
     )
-    .run_commands("pip install git+https://github.com/volcengine/verl.git")
-    .run_commands("pip install git+https://github.com/chandrasuda/tokasaurus.git@geoff/cartridges")
-    .pip_install("requests")
+    # Install veRL from our fork (has CartridgeConfig, top-k CE, KVFromText fix, etc.)
     .run_commands(
-        "python3 -c \""
-        "import urllib.request, zipfile, shutil, os; "
-        "urllib.request.urlretrieve("
-        "'https://github.com/chandrasuda/on-policy-cartridge-training/archive/refs/heads/main.zip', "
-        "'/tmp/p.zip'); "
-        "zipfile.ZipFile('/tmp/p.zip').extractall('/opt/'); "
-        "shutil.move('/opt/on-policy-cartridge-training-main', '/opt/patches'); "
-        "os.remove('/tmp/p.zip'); "
-        "print(os.listdir('/opt/patches/verl_patches/'))"
-        "\""
+        "git clone https://github.com/chandrasuda/verl-cartridge.git /opt/verl-cartridge "
+        "&& pip install -e /opt/verl-cartridge"
     )
+    .run_commands("pip install git+https://github.com/chandrasuda/tokasaurus.git@geoff/cartridges")
     .pip_install(
-        "transformers==4.53.0", "ray[default]", "omegaconf", "hydra-core",
+        "requests", "transformers==4.53.0", "ray[default]", "omegaconf", "hydra-core",
         "pandas", "pyarrow", "aiohttp", "codetiming", "torchdata", "peft",
         "cachetools", "datasets", "tiktoken",
     )
+    .run_commands("echo 'fork-v2'")  # force rebuild
 )
 
 app = modal.App("speed-test", image=image)
@@ -58,32 +50,15 @@ app = modal.App("speed-test", image=image)
 def test_speed():
     import subprocess, os, sys, json, time
 
-    # 1. Apply veRL patches (same as modal_train.py)
     import verl
     verl_path = os.path.dirname(os.path.dirname(verl.__file__))
     print(f"veRL installed at: {verl_path}")
 
-    patches_dir = "/opt/patches/verl_patches"
-    for patch_file in sorted(os.listdir(patches_dir)):
-        if patch_file.endswith(".patch"):
-            patch_path = os.path.join(patches_dir, patch_file)
-            print(f"Applying {patch_file}...")
-            r = subprocess.run(
-                ["patch", "-p1", "--forward", "--reject-file=-", "-d", verl_path, "-i", patch_path],
-                capture_output=True, text=True,
-            )
-            if r.returncode == 0:
-                print(f"  ✓ Applied")
-            elif "already applied" in r.stdout.lower() or "reversed" in r.stdout.lower():
-                print(f"  ✓ Already applied")
-            else:
-                print(f"  ⚠ patch returned {r.returncode}: {r.stdout[:200]} {r.stderr[:200]}")
+    # Verify CartridgeConfig exists (installed from fork)
+    from verl.workers.config.actor import CartridgeConfig
+    print(f"✓ CartridgeConfig found: {CartridgeConfig}")
 
-    # Also apply our local changes (top-k CE, KVFromText fix, checkpoint saving)
-    # These are in our forked verl, not in the patches repo
-    # For the speed test, the patches from the repo should be sufficient
-
-    # 2. Create minimal training data (just 200 prompts for the speed test)
+    # 1. Create minimal training data (just 200 prompts for the speed test)
     os.makedirs("/root/data/cartridge_distill", exist_ok=True)
     import pandas as pd
     prompts = []
@@ -144,6 +119,7 @@ def test_speed():
         "+actor_rollout_ref.actor.cartridge.num_frozen_tokens=1",
         "+actor_rollout_ref.actor.cartridge.lr=0.02",
         "actor_rollout_ref.rollout.name=tokasaurus",
+        "actor_rollout_ref.rollout.tensor_model_parallel_size=1",
         "actor_rollout_ref.rollout.temperature=0.7",
         "actor_rollout_ref.rollout.n=1",
         "actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=4",

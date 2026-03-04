@@ -134,7 +134,7 @@ def train():
         #
         "actor_rollout_ref.actor.strategy=fsdp",
         "actor_rollout_ref.actor.ppo_mini_batch_size=32",
-        "actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=1",
+        "actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=8",
         "actor_rollout_ref.actor.use_kl_loss=True",
         "actor_rollout_ref.actor.kl_loss_coef=1.0",
         "actor_rollout_ref.actor.kl_loss_type=low_var_kl",
@@ -175,10 +175,10 @@ def train():
         "trainer.nnodes=1",
         "trainer.save_freq=-1",  # Disable full-model checkpointing (CacheAndModel missing .config)
         "trainer.test_freq=-1",  # Disable reward-based test (dummy reward = useless)
-        "+trainer.cartridge_save_freq=128",  # Save cache .pt every 128 steps (matches off-policy eval freq)
+        "+trainer.cartridge_save_freq=50",  # Save cache .pt every 50 steps for eval
         "trainer.default_local_dir=/results/onpolicy",
         "trainer.total_epochs=100",  # Large — actual limit is total_training_steps below
-        "trainer.total_training_steps=2700",  # Match off-policy (~2694 steps)
+        "trainer.total_training_steps=300",  # ~15 hours at ~179s/step
         "trainer.val_before_train=False",
     ]
 
