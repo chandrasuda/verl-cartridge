@@ -1297,7 +1297,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         import os, time
         from verl.utils.torch_functional import logprobs_from_logits
 
-        TEACHER_MICRO_BATCH = 8  # samples per forward pass (tune for VRAM)
+        TEACHER_MICRO_BATCH = 4  # samples per forward pass (8 OOMs on A100-80GB with 18GB free)
         TOP_K = 20
 
         # Load patient documents (cached)
