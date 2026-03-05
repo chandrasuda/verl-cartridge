@@ -45,7 +45,7 @@ app = modal.App("speed-test", image=image)
 @app.function(
     gpu=GPU,
     secrets=[modal.Secret.from_name("huggingface-secret")],
-    timeout=3600,
+    timeout=7200,  # 2 hours
 )
 def test_speed():
     import subprocess, os, sys, json, time
@@ -66,6 +66,8 @@ def test_speed():
         prompts.append({
             "prompt": [{"role": "user", "content": f"Question {i}: What is the diagnosis for a patient with chest pain?"}],
             "patient_id": f"patient_{(i % 10) + 1:02d}",
+            "data_source": "longhealth",
+            "reward_model": {"ground_truth": "A"},
         })
     df = pd.DataFrame(prompts)
     df.to_parquet("/root/data/cartridge_distill/train.parquet")
@@ -96,14 +98,14 @@ def test_speed():
         "algorithm.adv_estimator=grpo",
         "data.train_files=/root/data/cartridge_distill/train.parquet",
         "data.val_files=/root/data/cartridge_distill/val.parquet",
-        "data.train_batch_size=32",
+        "data.train_batch_size=8",  # smaller for speed test (faster turnaround)
         "data.max_prompt_length=512",
         "data.max_response_length=256",  # shorter for speed
         "data.filter_overlong_prompts=True",
         "actor_rollout_ref.model.path=meta-llama/Llama-3.2-3B-Instruct",
         "actor_rollout_ref.model.enable_gradient_checkpointing=True",
         "actor_rollout_ref.actor.strategy=fsdp",
-        "actor_rollout_ref.actor.ppo_mini_batch_size=32",
+        "actor_rollout_ref.actor.ppo_mini_batch_size=8",
         "actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=1",
         "actor_rollout_ref.actor.use_kl_loss=True",
         "actor_rollout_ref.actor.kl_loss_coef=1.0",

@@ -45,7 +45,7 @@ image = (
         "pip install git+https://github.com/chandrasuda/tokasaurus.git@geoff/cartridges"
     )
     .pip_install("requests")
-    .run_commands("echo 'fork-install-v1'")  # bump to force image rebuild
+    .run_commands("echo 'fork-install-v2'")  # bump to force image rebuild
     .pip_install(
         "transformers==4.53.0",
         "ray[default]",
@@ -95,9 +95,43 @@ def train():
     print(f"✓ veRL fork installed with CartridgeConfig")
 
     # Prepare training data (extract prompts from paper's HF data)
-    subprocess.run([
-        sys.executable, "/opt/verl-cartridge/examples/cartridge_distill/prepare_data.py"
-    ], check=True)
+    result = subprocess.run(
+        [sys.executable, "/opt/verl-cartridge/examples/cartridge_distill/prepare_data.py"],
+        capture_output=True, text=True
+    )
+    if result.returncode != 0:
+        print(f"⚠ prepare_data.py failed: {result.stderr[-500:]}")
+        print("Falling back to simple prompt generation...")
+        # Fallback: generate diverse medical prompts for 10 patients
+        import pandas as pd
+        prompts = []
+        questions = [
+            "Summarize the key medical findings and diagnoses.",
+            "What medications were prescribed and why?",
+            "Describe the patient's medical history in detail.",
+            "What were the lab results and their implications?",
+            "List all surgical procedures performed.",
+            "What is the current treatment plan?",
+            "Describe any allergies or adverse reactions.",
+            "What follow-up appointments are recommended?",
+            "Summarize the discharge instructions.",
+            "What are the risk factors for this patient?",
+        ]
+        for i in range(10000):  # 10K prompts for 300 steps × 32 batch
+            pid = f"patient_{(i % 10) + 1:02d}"
+            q = questions[i % len(questions)]
+            prompts.append({
+                "prompt": [{"role": "user", "content": f"For {pid}: {q}"}],
+                "patient_id": pid,
+                "data_source": "longhealth",
+                "reward_model": {"ground_truth": "", "style": "rule"},
+            })
+        os.makedirs(os.path.expanduser("~/data/cartridge_distill"), exist_ok=True)
+        pd.DataFrame(prompts).to_parquet(os.path.expanduser("~/data/cartridge_distill/train.parquet"))
+        pd.DataFrame(prompts[:200]).to_parquet(os.path.expanduser("~/data/cartridge_distill/val.parquet"))
+        print(f"✓ Created {len(prompts)} training prompts (fallback)")
+    else:
+        print(result.stdout[-500:] if result.stdout else "prepare_data.py completed")
 
     # Pre-download LongHealth data for the teacher
     import requests as req
@@ -110,7 +144,7 @@ def train():
     # Create dummy reward function (cartridge uses KL loss, not rewards)
     os.makedirs("/tmp/reward", exist_ok=True)
     with open("/tmp/reward/dummy_reward.py", "w") as f:
-        f.write("def compute_score(data_source, solution_str, ground_truth, extra_info=None):\\n    return 0.0\\n")
+        f.write("def compute_score(data_source, solution_str, ground_truth, extra_info=None):\n    return 0.0\n")
 
     # Run training
     env = os.environ.copy()
@@ -178,7 +212,7 @@ def train():
         "+trainer.cartridge_save_freq=50",  # Save cache .pt every 50 steps for eval
         "trainer.default_local_dir=/results/onpolicy",
         "trainer.total_epochs=100",  # Large — actual limit is total_training_steps below
-        "trainer.total_training_steps=300",  # ~15 hours at ~179s/step
+        "trainer.total_training_steps=5",  # SPEED TEST: 5 steps only
         "trainer.val_before_train=False",
     ]
 
@@ -196,19 +230,28 @@ def train():
 
     # Save the trained cartridge to persistent volume
     print("\n" + "=" * 60)
-    print("Training complete. Saving cartridge to /cartridge_output/...")
+    print("Training complete. Saving results to volume...")
     print("=" * 60)
 
-    # The cartridge was saved to /tmp/verl_cartridge_latest.pt during the last sync
-    import shutil
+    # Copy all cartridge checkpoints to volume
+    import shutil, glob
+    ckpt_dir = "/results/onpolicy/cartridge_checkpoints"
+    if os.path.exists(ckpt_dir):
+        ckpts = glob.glob(os.path.join(ckpt_dir, "cache-step*.pt"))
+        print(f"✓ Found {len(ckpts)} cartridge checkpoints")
+        for c in sorted(ckpts):
+            print(f"  {os.path.basename(c)}")
+    else:
+        print(f"⚠ No checkpoint dir at {ckpt_dir}")
+
+    # Also copy the latest synced cartridge
     src = "/tmp/verl_cartridge_latest.pt"
-    dst = "/cartridge_output/on_policy_cartridge.pt"
+    dst = "/results/onpolicy/on_policy_cartridge_final.pt"
     if os.path.exists(src):
         shutil.copy2(src, dst)
-        cartridge_volume.commit()
-        print(f"✓ Saved on-policy cartridge to volume: {dst}")
-    else:
-        print(f"⚠ Cartridge not found at {src}. It may not have been synced.")
+        print(f"✓ Saved final cartridge: {dst}")
+
+    results_volume.commit()
 
     return result.returncode
 
@@ -217,7 +260,7 @@ def train():
     gpu="A10G",
     secrets=[modal.Secret.from_name("huggingface-secret")],
     timeout=1800,
-    volumes={"/cartridge_output": cartridge_volume},
+    volumes={"/results": results_volume},
 )
 def eval_cartridge():
     """Evaluate on-policy cartridge on LongHealth."""
@@ -236,7 +279,7 @@ def eval_cartridge():
     ).cuda().eval()
 
     # Load on-policy cartridge
-    ckpt_path = "/cartridge_output/on_policy_cartridge.pt"
+    ckpt_path = "/results/onpolicy/on_policy_cartridge_final.pt"
     import os
     if os.path.exists(ckpt_path):
         # Rename fixed_keys if needed
