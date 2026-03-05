@@ -1358,17 +1358,30 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             response_mask = data.batch["response_mask"][i]
             valid_response_len = int(response_mask.sum().item())
 
-            # Look up document — patient_id first, then name matching fallback
+            # Look up document — try patient_id from multiple locations, then name matching
             doc_ids_list = []
             matched = False
+            pid = None
 
-            if "patient_id" in data.non_tensor_batch:
+            # Strategy 1: patient_id as top-level non_tensor field
+            if not matched and "patient_id" in data.non_tensor_batch:
                 pid = str(data.non_tensor_batch["patient_id"][i])
                 if pid in self._patient_doc_ids:
                     doc_ids_list = self._patient_doc_ids[pid]
                     matched = True
                     teacher_hits += 1
 
+            # Strategy 2: patient_id inside extra_info (veRL preserves extra_info through pipeline)
+            if not matched and "extra_info" in data.non_tensor_batch:
+                ei = data.non_tensor_batch["extra_info"][i]
+                if isinstance(ei, dict) and "patient_id" in ei:
+                    pid = str(ei["patient_id"])
+                    if pid in self._patient_doc_ids:
+                        doc_ids_list = self._patient_doc_ids[pid]
+                        matched = True
+                        teacher_hits += 1
+
+            # Strategy 3: fall back to name matching on decoded prompt text
             if not matched:
                 prompt_text = self.tokenizer.decode(valid_ids[:600].tolist(), skip_special_tokens=True)
                 for pid, pname in self._patient_names.items():
