@@ -83,16 +83,16 @@ def extract_prompts_from_hf_shard(repo_id: str, limit: int = None) -> list[dict]
         df = table.to_pandas()
 
         for _, row in df.iterrows():
-            messages = row.get("messages", [])
-            if not messages:
+            messages = row.get("messages", None)
+            if messages is None or len(messages) == 0:
                 continue
 
             # Find the first user message
             user_content = None
             for msg in messages:
-                role = msg.get("role", "")
+                role = msg["role"] if isinstance(msg, dict) else ""
                 if role == "user":
-                    user_content = msg.get("content", "")
+                    user_content = msg["content"] if isinstance(msg, dict) else ""
                     break
 
             if not user_content:
