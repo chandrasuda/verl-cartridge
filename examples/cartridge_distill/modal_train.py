@@ -37,7 +37,7 @@ image = (
     )
     # Install veRL from our fork (has cartridge support baked in)
     # Cache bust: change the echo to force re-clone on code changes
-    .run_commands("echo 'verl-fork-v9-patient-id-fix'")
+    .run_commands("echo 'verl-fork-v11-inline-eval'")
     .run_commands(
         "git clone https://github.com/chandrasuda/verl-cartridge.git /opt/verl-cartridge "
         "&& pip install -e /opt/verl-cartridge"
@@ -224,7 +224,150 @@ def train():
 
     results_volume.commit()
 
+    # ------------------------------------------------------------------
+    # 5. Evaluate all saved checkpoints on LongHealth
+    # ------------------------------------------------------------------
+    _eval_all_checkpoints(ckpt_dir)
+    results_volume.commit()
+
     return result.returncode
+
+
+def _eval_all_checkpoints(ckpt_dir: str):
+    """Evaluate all cartridge checkpoints on LongHealth after training.
+
+    Loads FlexLlama + each cache checkpoint, runs 40 MC questions,
+    and saves accuracy curve to /results/onpolicy_eval.json.
+    """
+    import glob
+    import json
+    import os
+    import re
+    import time
+    import requests as http_req
+
+    import torch
+    from transformers import AutoTokenizer
+    from cartridges.models.llama.modeling_llama import FlexLlamaForCausalLM
+    from cartridges.cache import TrainableCache
+    from cartridges.generation import flex_generate
+
+    NUM_EVAL = 40
+    MODEL = "meta-llama/Llama-3.2-3B-Instruct"
+
+    ckpts = sorted(glob.glob(os.path.join(ckpt_dir, "cache-step*.pt")))
+    if not ckpts:
+        print("[eval] No checkpoints found, skipping eval")
+        return
+
+    print(f"\n{'='*60}")
+    print(f"EVALUATING {len(ckpts)} CHECKPOINTS ON LONGHEALTH")
+    print(f"{'='*60}\n")
+
+    # Load LongHealth questions
+    data = http_req.get(
+        "https://raw.githubusercontent.com/kbressem/LongHealth/refs/heads/main/data/benchmark_v5.json"
+    ).json()
+
+    questions = []
+    for pid, patient in data.items():
+        if int(pid.split("_")[1]) > 8:
+            continue
+        for q in patient["questions"]:
+            options = "\n".join(f"{L}) {q[f'answer_{L.lower()}']}" for L in "ABCDE")
+            prompt = (
+                f"You are answering a multiple choice question about patient {patient['name']}.\n\n"
+                f"Question: {q['question']}\n\nOptions:\n{options}\n\n"
+                f"Answer with ONLY the letter (A, B, C, D, or E):"
+            )
+            answer_map = {q[f"answer_{L.lower()}"]: L for L in "ABCDE"}
+            questions.append({
+                "prompt": prompt,
+                "correct": answer_map.get(q["correct"], "?"),
+            })
+    eval_qs = questions[:NUM_EVAL]
+    print(f"Eval questions: {len(eval_qs)}")
+
+    def extract_answer(text):
+        m = re.search(r'\b([A-E])\b', text.strip()[:20])
+        return m.group(1) if m else "?"
+
+    # Load model + tokenizer
+    print(f"Loading {MODEL}...")
+    tokenizer = AutoTokenizer.from_pretrained(MODEL)
+    model = FlexLlamaForCausalLM.from_pretrained(MODEL, torch_dtype=torch.bfloat16).cuda().eval()
+    print("✓ Model loaded")
+
+    # Baseline eval (no cartridge)
+    print("\n--- Baseline (no cartridge) ---")
+    correct_bl = 0
+    for q in eval_qs:
+        ids = tokenizer.encode(q["prompt"], return_tensors="pt").cuda()
+        with torch.no_grad():
+            out = model.generate(ids, max_new_tokens=10, do_sample=False)
+        pred = extract_answer(tokenizer.decode(out[0][ids.shape[1]:], skip_special_tokens=True))
+        if pred == q["correct"]:
+            correct_bl += 1
+    baseline_acc = correct_bl / len(eval_qs) * 100
+    print(f"  Baseline: {correct_bl}/{len(eval_qs)} ({baseline_acc:.1f}%)")
+
+    # Eval each checkpoint
+    results = {
+        "baseline": {"correct": correct_bl, "total": len(eval_qs), "accuracy": baseline_acc},
+        "evals": [],
+    }
+
+    for ckpt_path in ckpts:
+        m = re.search(r"cache-step(\d+)\.pt", ckpt_path)
+        if not m:
+            continue
+        step = int(m.group(1))
+
+        print(f"\n--- Step {step} ---")
+        try:
+            ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+            if "fixed_keys" in ckpt and "frozen_keys" not in ckpt:
+                ckpt["frozen_keys"] = ckpt.pop("fixed_keys")
+                ckpt["frozen_values"] = ckpt.pop("fixed_values")
+                torch.save(ckpt, ckpt_path)
+            del ckpt
+
+            cache = TrainableCache.from_pretrained(ckpt_path).cuda()
+            correct = 0
+            for q in eval_qs:
+                ids = tokenizer.encode(q["prompt"], return_tensors="pt").cuda()
+                cache.clear()
+                out_ids = flex_generate(
+                    model=model, tokenizer=tokenizer, cache=cache,
+                    input_ids=ids, max_new_tokens=10, temperature=0.0,
+                )
+                pred = extract_answer(tokenizer.decode(out_ids[0][ids.shape[1]:], skip_special_tokens=True))
+                if pred == q["correct"]:
+                    correct += 1
+
+            acc = correct / len(eval_qs) * 100
+            print(f"  Step {step}: {correct}/{len(eval_qs)} ({acc:.1f}%)")
+            results["evals"].append({"step": step, "correct": correct, "total": len(eval_qs), "accuracy": acc})
+
+            del cache
+            torch.cuda.empty_cache()
+        except Exception as e:
+            print(f"  ✗ Step {step} failed: {e}")
+
+    # Save results
+    eval_path = "/results/onpolicy_eval.json"
+    with open(eval_path, "w") as f:
+        json.dump(results, f, indent=2)
+    print(f"\n✓ Saved eval results to {eval_path}")
+
+    # Print summary
+    print(f"\n{'='*60}")
+    print("EVAL SUMMARY")
+    print(f"{'='*60}")
+    print(f"  Baseline:  {baseline_acc:.1f}%")
+    for e in sorted(results["evals"], key=lambda x: x["step"]):
+        print(f"  Step {e['step']:>4}:  {e['accuracy']:.1f}%")
+    print(f"{'='*60}")
 
 
 @app.function(
