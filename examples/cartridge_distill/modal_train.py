@@ -45,7 +45,7 @@ image = (
         "pip install git+https://github.com/chandrasuda/tokasaurus.git@geoff/cartridges"
     )
     .pip_install("requests")
-    .run_commands("echo 'fork-install-v3'")  # bump to force image rebuild
+    .run_commands("echo 'fork-install-v4'")  # bump to force image rebuild
     .pip_install(
         "transformers==4.53.0",
         "ray[default]",
