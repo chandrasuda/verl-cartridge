@@ -36,6 +36,8 @@ image = (
         "git clone https://github.com/HazyResearch/cartridges.git /opt/cartridges && pip install -e /opt/cartridges"
     )
     # Install veRL from our fork (has cartridge support baked in)
+    # Cache bust: change the echo to force re-clone on code changes
+    .run_commands("echo 'verl-fork-v5'")
     .run_commands(
         "git clone https://github.com/chandrasuda/verl-cartridge.git /opt/verl-cartridge "
         "&& pip install -e /opt/verl-cartridge"
@@ -45,7 +47,6 @@ image = (
         "pip install git+https://github.com/chandrasuda/tokasaurus.git@geoff/cartridges"
     )
     .pip_install("requests")
-    .run_commands("echo 'fork-install-v4'")  # bump to force image rebuild
     .pip_install(
         "transformers==4.53.0",
         "ray[default]",
@@ -62,6 +63,7 @@ image = (
 )
 
 results_volume = modal.Volume.from_name("onpolicy-results", create_if_missing=True)
+data_volume = modal.Volume.from_name("training-data")
 app = modal.App("onpolicy-training", image=image)
 
 
@@ -72,7 +74,7 @@ app = modal.App("onpolicy-training", image=image)
     min_containers=0,
     max_containers=1,
     scaledown_window=600,
-    volumes={"/results": results_volume},
+    volumes={"/results": results_volume, "/data": data_volume},
 )
 def train():
     """Run cartridge distillation training."""
@@ -94,44 +96,13 @@ def train():
     from verl.workers.config.actor import CartridgeConfig
     print(f"✓ veRL fork installed with CartridgeConfig")
 
-    # Prepare training data (extract prompts from paper's HF data)
-    result = subprocess.run(
-        [sys.executable, "/opt/verl-cartridge/examples/cartridge_distill/prepare_data.py"],
-        capture_output=True, text=True
-    )
-    if result.returncode != 0:
-        print(f"⚠ prepare_data.py failed: {result.stderr[-500:]}")
-        print("Falling back to simple prompt generation...")
-        # Fallback: generate diverse medical prompts for 10 patients
-        import pandas as pd
-        prompts = []
-        questions = [
-            "Summarize the key medical findings and diagnoses.",
-            "What medications were prescribed and why?",
-            "Describe the patient's medical history in detail.",
-            "What were the lab results and their implications?",
-            "List all surgical procedures performed.",
-            "What is the current treatment plan?",
-            "Describe any allergies or adverse reactions.",
-            "What follow-up appointments are recommended?",
-            "Summarize the discharge instructions.",
-            "What are the risk factors for this patient?",
-        ]
-        for i in range(10000):  # 10K prompts for 300 steps × 32 batch
-            pid = f"patient_{(i % 10) + 1:02d}"
-            q = questions[i % len(questions)]
-            prompts.append({
-                "prompt": [{"role": "user", "content": f"For {pid}: {q}"}],
-                "patient_id": pid,
-                "data_source": "longhealth",
-                "reward_model": {"ground_truth": "", "style": "rule"},
-            })
-        os.makedirs(os.path.expanduser("~/data/cartridge_distill"), exist_ok=True)
-        pd.DataFrame(prompts).to_parquet(os.path.expanduser("~/data/cartridge_distill/train.parquet"))
-        pd.DataFrame(prompts[:200]).to_parquet(os.path.expanduser("~/data/cartridge_distill/val.parquet"))
-        print(f"✓ Created {len(prompts)} training prompts (fallback)")
-    else:
-        print(result.stdout[-500:] if result.stdout else "prepare_data.py completed")
+    # Verify pre-processed data from volume
+    train_parquet = "/data/cartridge_distill/train.parquet"
+    val_parquet = "/data/cartridge_distill/val.parquet"
+    assert os.path.exists(train_parquet), f"Missing {train_parquet} — upload to 'training-data' volume"
+    assert os.path.exists(val_parquet), f"Missing {val_parquet} — upload to 'training-data' volume"
+    print(f"✓ Training data: {train_parquet}")
+    print(f"✓ Validation data: {val_parquet}")
 
     # Pre-download LongHealth data for the teacher
     import requests as req
@@ -154,8 +125,8 @@ def train():
         sys.executable, "-m", "verl.trainer.main_ppo",
         "algorithm.adv_estimator=grpo",
         #
-        "data.train_files=/root/data/cartridge_distill/train.parquet",
-        "data.val_files=/root/data/cartridge_distill/val.parquet",
+        "data.train_files=/data/cartridge_distill/train.parquet",
+        "data.val_files=/data/cartridge_distill/val.parquet",
         "data.train_batch_size=32",
         "data.max_prompt_length=512",
         "data.max_response_length=512",
@@ -209,10 +180,10 @@ def train():
         "trainer.nnodes=1",
         "trainer.save_freq=-1",  # Disable full-model checkpointing (CacheAndModel missing .config)
         "trainer.test_freq=-1",  # Disable reward-based test (dummy reward = useless)
-        "+trainer.cartridge_save_freq=50",  # Save cache .pt every 50 steps for eval
+        "+trainer.cartridge_save_freq=10",  # Save cache .pt every 10 steps so we can eval early
         "trainer.default_local_dir=/results/onpolicy",
         "trainer.total_epochs=100",  # Large — actual limit is total_training_steps below
-        "trainer.total_training_steps=5",  # SPEED TEST: 5 steps only
+        "trainer.total_training_steps=300",  # ~15 hours at ~180s/step
         "trainer.val_before_train=False",
     ]
 

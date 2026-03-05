@@ -99,7 +99,7 @@ app = modal.App("tokasaurus-cartridge-server", image=image)
     # max_containers=1 prevents runaway auto-scaling (was hitting 10 GPUs).
     min_containers=0,
     max_containers=1,
-    scaledown_window=300,  # shut down after 5 min idle
+    scaledown_window=1800,  # shut down after 30 min idle (steps can take 7+ min)
 )
 @modal.web_server(port=PORT, startup_timeout=600)
 def serve():

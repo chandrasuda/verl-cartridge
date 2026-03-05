@@ -122,16 +122,18 @@ def main():
         "hazyresearch/m07d11_longhealth_synthesize_llama-3.2-3b_p10_n65536-2",
     ]
 
-    # Extract prompts from shards 0+1 for training, shard 2 for val
+    # Extract prompts from ALL 3 shards for training (same 196K as off-policy)
     train_prompts = []
-    for shard in hf_shards[:2]:
+    for shard in hf_shards:
         print(f"\nExtracting prompts from {shard}...")
         train_prompts.extend(extract_prompts_from_hf_shard(shard))
     print(f"\nTotal train prompts: {len(train_prompts)}")
 
-    print(f"\nExtracting prompts from {hf_shards[2]}...")
-    val_prompts = extract_prompts_from_hf_shard(hf_shards[2], limit=500)
-    print(f"Val prompts: {len(val_prompts)}")
+    # Val = small random subset of training prompts (eval is LongHealth, not val loss)
+    import random
+    random.seed(42)
+    val_prompts = random.sample(train_prompts, min(500, len(train_prompts)))
+    print(f"Val prompts: {len(val_prompts)} (random subset)")
 
     out_dir = Path(os.environ.get("DATA_DIR", str(Path.home() / "data"))) / "cartridge_distill"
     out_dir.mkdir(parents=True, exist_ok=True)

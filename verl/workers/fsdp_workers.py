@@ -1359,19 +1359,33 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 response_mask = data.batch["response_mask"][i]
                 valid_response_len = int(response_mask.sum().item())
 
-                # Find patient documents from prompt text
-                prompt_text = self.tokenizer.decode(valid_ids[:300].tolist(), skip_special_tokens=True)
+                # Find patient documents — use patient_id from batch first, fall back to name matching
                 doc_ids_list = []
-                matched_name = None
-                for pid, pname in self._patient_names.items():
-                    if pname and pname in prompt_text:
+                matched = False
+
+                # Strategy 1: use patient_id from the preprocessed data (100% match rate)
+                if "patient_id" in data.non_tensor_batch:
+                    pid = str(data.non_tensor_batch["patient_id"][i])
+                    if pid in self._patient_docs:
                         doc_text = self._patient_docs[pid]
                         doc_ids_list = self.tokenizer.encode(doc_text, add_special_tokens=False)
-                        matched_name = pname
+                        matched = True
                         teacher_hits += 1
-                        break
-                if not matched_name and i == 0:
-                    print(f"[cartridge-ref] NO MATCH for sample 0. First 100 chars: {prompt_text[:100]}")
+
+                # Strategy 2: fall back to name matching on decoded prompt text
+                if not matched:
+                    prompt_text = self.tokenizer.decode(valid_ids[:600].tolist(), skip_special_tokens=True)
+                    for pid, pname in self._patient_names.items():
+                        if pname and pname in prompt_text:
+                            doc_text = self._patient_docs[pid]
+                            doc_ids_list = self.tokenizer.encode(doc_text, add_special_tokens=False)
+                            teacher_hits += 1
+                            matched = True
+                            break
+
+                if not matched and i == 0:
+                    available_keys = list(data.non_tensor_batch.keys()) if data.non_tensor_batch else []
+                    print(f"[cartridge-ref] NO MATCH for sample 0. non_tensor keys: {available_keys}")
 
                 # Build extended input: [doc_tokens + original_valid_tokens]
                 if doc_ids_list:
