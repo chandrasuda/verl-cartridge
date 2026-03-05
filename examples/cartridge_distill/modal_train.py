@@ -37,7 +37,7 @@ image = (
     )
     # Install veRL from our fork (has cartridge support baked in)
     # Cache bust: change the echo to force re-clone on code changes
-    .run_commands("echo 'verl-fork-v8-teacher-mb4'")
+    .run_commands("echo 'verl-fork-v9-patient-id-fix'")
     .run_commands(
         "git clone https://github.com/chandrasuda/verl-cartridge.git /opt/verl-cartridge "
         "&& pip install -e /opt/verl-cartridge"

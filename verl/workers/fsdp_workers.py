@@ -1358,10 +1358,11 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             response_mask = data.batch["response_mask"][i]
             valid_response_len = int(response_mask.sum().item())
 
-            # Look up document — try patient_id from multiple locations, then name matching
+            # Look up document — try multiple strategies for patient_id
             doc_ids_list = []
             matched = False
             pid = None
+            match_strategy = None
 
             # Strategy 1: patient_id as top-level non_tensor field
             if not matched and "patient_id" in data.non_tensor_batch:
@@ -1369,9 +1370,10 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 if pid in self._patient_doc_ids:
                     doc_ids_list = self._patient_doc_ids[pid]
                     matched = True
+                    match_strategy = "top-level"
                     teacher_hits += 1
 
-            # Strategy 2: patient_id inside extra_info (veRL preserves extra_info through pipeline)
+            # Strategy 2: patient_id inside extra_info
             if not matched and "extra_info" in data.non_tensor_batch:
                 ei = data.non_tensor_batch["extra_info"][i]
                 if isinstance(ei, dict) and "patient_id" in ei:
@@ -1379,21 +1381,47 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                     if pid in self._patient_doc_ids:
                         doc_ids_list = self._patient_doc_ids[pid]
                         matched = True
+                        match_strategy = "extra_info"
                         teacher_hits += 1
 
-            # Strategy 3: fall back to name matching on decoded prompt text
+            # Strategy 3: name matching on raw_prompt (survives veRL pipeline intact)
+            if not matched and "raw_prompt" in data.non_tensor_batch:
+                rp = data.non_tensor_batch["raw_prompt"][i]
+                rp_text = ""
+                if isinstance(rp, list):
+                    rp_text = " ".join(m.get("content", "") for m in rp if isinstance(m, dict))
+                elif isinstance(rp, str):
+                    rp_text = rp
+                for pid_candidate, pname in self._patient_names.items():
+                    if pname and pname in rp_text:
+                        doc_ids_list = self._patient_doc_ids[pid_candidate]
+                        matched = True
+                        match_strategy = "raw_prompt"
+                        teacher_hits += 1
+                        break
+
+            # Strategy 4: name matching on decoded token ids (broadest search)
             if not matched:
-                prompt_text = self.tokenizer.decode(valid_ids[:600].tolist(), skip_special_tokens=True)
-                for pid, pname in self._patient_names.items():
+                prompt_text = self.tokenizer.decode(valid_ids.tolist(), skip_special_tokens=True)
+                for pid_candidate, pname in self._patient_names.items():
                     if pname and pname in prompt_text:
-                        doc_ids_list = self._patient_doc_ids[pid]
+                        doc_ids_list = self._patient_doc_ids[pid_candidate]
                         teacher_hits += 1
                         matched = True
+                        match_strategy = "decoded_text"
                         break
 
             if not matched and i == 0:
                 available_keys = list(data.non_tensor_batch.keys()) if data.non_tensor_batch else []
-                print(f"[cartridge-ref] NO MATCH for sample 0. non_tensor keys: {available_keys}")
+                ei_sample = data.non_tensor_batch.get("extra_info", [None])[0]
+                rp_sample = str(data.non_tensor_batch.get("raw_prompt", [None])[0])[:200]
+                print(f"[cartridge-ref] NO MATCH for sample 0.")
+                print(f"  non_tensor keys: {available_keys}")
+                print(f"  extra_info type={type(ei_sample).__name__} val={str(ei_sample)[:200]}")
+                print(f"  raw_prompt[:200]: {rp_sample}")
+
+            if i == 0 and matched:
+                print(f"[cartridge-ref] Sample 0 matched via '{match_strategy}' → {pid}")
 
             if doc_ids_list:
                 doc_tensor = torch.tensor(doc_ids_list, dtype=torch.long, device=device)
