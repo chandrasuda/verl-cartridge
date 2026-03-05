@@ -1291,21 +1291,21 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     def _compute_ref_with_documents(self, data: DataProto):
         """Compute ref logprobs with full patient documents prepended.
 
-        For each sample:
-        1. Decode prompt tokens → match patient name → look up documents
-        2. Tokenize documents, prepend to input_ids
-        3. Forward pass through ref model (standard Llama with flash attention)
-        4. Extract logprobs for only the response tokens
+        Batched version: pads sequences to the same length within micro-batches
+        and runs a single forward pass per micro-batch instead of one per sample.
         """
-        import os
+        import os, time
         from verl.utils.torch_functional import logprobs_from_logits
 
-        # Load patient documents (cached). Try local file first, then HTTP.
+        TEACHER_MICRO_BATCH = 8  # samples per forward pass (tune for VRAM)
+        TOP_K = 20
+
+        # Load patient documents (cached)
         if not hasattr(self, "_patient_docs"):
             import json as _json
             self._patient_docs = {}
             self._patient_names = {}
-            # Try local file (saved by prepare_data.py or modal_train.py)
+            self._patient_doc_ids = {}  # cache tokenized docs
             lh_path = "/tmp/longhealth_data.json"
             try:
                 if os.path.exists(lh_path):
@@ -1319,20 +1319,21 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                         "https://raw.githubusercontent.com/kbressem/LongHealth/refs/heads/main/data/benchmark_v5.json",
                         timeout=30,
                     ).json()
-                    # Save for future use
                     with open(lh_path, "w") as f:
                         _json.dump(lh_data, f)
                     print(f"[cartridge-ref] Downloaded and saved to {lh_path}")
 
                 for pid, patient in lh_data.items():
-                    self._patient_docs[pid] = "\n\n".join(
+                    doc_text = "\n\n".join(
                         f"--- {did} ---\n{txt}" for did, txt in patient["texts"].items()
                     )
+                    self._patient_docs[pid] = doc_text
                     self._patient_names[pid] = patient["name"]
-                print(f"[cartridge-ref] {len(self._patient_docs)} patients loaded")
+                    # Pre-tokenize documents once (saves ~0.5s per step)
+                    self._patient_doc_ids[pid] = self.tokenizer.encode(doc_text, add_special_tokens=False)
+                print(f"[cartridge-ref] {len(self._patient_docs)} patients loaded and pre-tokenized")
             except Exception as e:
                 print(f"[cartridge-ref] FAILED to load documents: {e}")
-                # Return empty — will use ref model without documents
                 return self._compute_ref_without_documents(data)
 
         batch_size = data.batch["input_ids"].shape[0]
@@ -1340,109 +1341,144 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         temperature = data.meta_info.get("temperature", 1.0)
         device = get_device_id()
 
-        # Get ref model (unwrap FSDP if needed)
         ref_model = self.ref_module_fsdp
-
         if self._is_offload_param:
             load_fsdp_model_to_gpu(ref_model)
 
-        all_ref_logprobs = []
-        all_topk_logprobs = []
-        all_topk_ids = []
+        t0 = time.time()
+
+        # --- Phase 1: Build all extended sequences ---
+        ext_sequences = []  # list of (ext_ids_1d, doc_prompt_len, valid_response_len)
         teacher_hits = 0
 
-        with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-            for i in range(batch_size):
-                attention_mask = data.batch["attention_mask"][i]
-                input_ids = data.batch["input_ids"][i]
-                valid_ids = input_ids[attention_mask.bool()]
-                response_mask = data.batch["response_mask"][i]
-                valid_response_len = int(response_mask.sum().item())
+        for i in range(batch_size):
+            attention_mask = data.batch["attention_mask"][i]
+            input_ids = data.batch["input_ids"][i]
+            valid_ids = input_ids[attention_mask.bool()]
+            response_mask = data.batch["response_mask"][i]
+            valid_response_len = int(response_mask.sum().item())
 
-                # Find patient documents — use patient_id from batch first, fall back to name matching
-                doc_ids_list = []
-                matched = False
+            # Look up document — patient_id first, then name matching fallback
+            doc_ids_list = []
+            matched = False
 
-                # Strategy 1: use patient_id from the preprocessed data (100% match rate)
-                if "patient_id" in data.non_tensor_batch:
-                    pid = str(data.non_tensor_batch["patient_id"][i])
-                    if pid in self._patient_docs:
-                        doc_text = self._patient_docs[pid]
-                        doc_ids_list = self.tokenizer.encode(doc_text, add_special_tokens=False)
-                        matched = True
+            if "patient_id" in data.non_tensor_batch:
+                pid = str(data.non_tensor_batch["patient_id"][i])
+                if pid in self._patient_doc_ids:
+                    doc_ids_list = self._patient_doc_ids[pid]
+                    matched = True
+                    teacher_hits += 1
+
+            if not matched:
+                prompt_text = self.tokenizer.decode(valid_ids[:600].tolist(), skip_special_tokens=True)
+                for pid, pname in self._patient_names.items():
+                    if pname and pname in prompt_text:
+                        doc_ids_list = self._patient_doc_ids[pid]
                         teacher_hits += 1
+                        matched = True
+                        break
 
-                # Strategy 2: fall back to name matching on decoded prompt text
-                if not matched:
-                    prompt_text = self.tokenizer.decode(valid_ids[:600].tolist(), skip_special_tokens=True)
-                    for pid, pname in self._patient_names.items():
-                        if pname and pname in prompt_text:
-                            doc_text = self._patient_docs[pid]
-                            doc_ids_list = self.tokenizer.encode(doc_text, add_special_tokens=False)
-                            teacher_hits += 1
-                            matched = True
-                            break
+            if not matched and i == 0:
+                available_keys = list(data.non_tensor_batch.keys()) if data.non_tensor_batch else []
+                print(f"[cartridge-ref] NO MATCH for sample 0. non_tensor keys: {available_keys}")
 
-                if not matched and i == 0:
-                    available_keys = list(data.non_tensor_batch.keys()) if data.non_tensor_batch else []
-                    print(f"[cartridge-ref] NO MATCH for sample 0. non_tensor keys: {available_keys}")
+            if doc_ids_list:
+                doc_tensor = torch.tensor(doc_ids_list, dtype=torch.long, device=device)
+                ext_ids = torch.cat([doc_tensor, valid_ids.to(device)])
+            else:
+                ext_ids = valid_ids.to(device)
 
-                # Build extended input: [doc_tokens + original_valid_tokens]
-                if doc_ids_list:
-                    doc_tensor = torch.tensor(doc_ids_list, dtype=torch.long, device=device)
-                    ext_ids = torch.cat([doc_tensor, valid_ids.to(device)]).unsqueeze(0)
-                else:
-                    ext_ids = valid_ids.to(device).unsqueeze(0)
+            doc_prompt_len = len(ext_ids) - valid_response_len
+            ext_sequences.append((ext_ids, doc_prompt_len, valid_response_len))
 
-                ext_len = ext_ids.shape[1]
-                ext_mask = torch.ones(1, ext_len, dtype=torch.long, device=device)
-                ext_pos = torch.arange(ext_len, dtype=torch.long, device=device).unsqueeze(0)
+        # --- Phase 2: Batched forward passes in micro-batches ---
+        all_ref_logprobs = [None] * batch_size
+        all_topk_logprobs = [None] * batch_size
+        all_topk_ids = [None] * batch_size
 
-                # Forward pass through ref model
+        def _pad_to(t, target_len, pad_val=0):
+            if t.shape[0] < target_len:
+                pad_shape = list(t.shape)
+                pad_shape[0] = target_len - t.shape[0]
+                t = torch.cat([t, torch.full(pad_shape, pad_val, dtype=t.dtype, device=t.device)])
+            return t[:target_len]
+
+        with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            for mb_start in range(0, batch_size, TEACHER_MICRO_BATCH):
+                mb_end = min(mb_start + TEACHER_MICRO_BATCH, batch_size)
+                mb_indices = list(range(mb_start, mb_end))
+                mb_seqs = [ext_sequences[i] for i in mb_indices]
+
+                # Pad to max length in this micro-batch
+                max_len = max(len(s[0]) for s in mb_seqs)
+                padded_ids = []
+                padded_mask = []
+                padded_pos = []
+
+                for ext_ids, _, _ in mb_seqs:
+                    pad_len = max_len - len(ext_ids)
+                    # Left-pad so response tokens are right-aligned
+                    if pad_len > 0:
+                        pad_t = torch.zeros(pad_len, dtype=torch.long, device=device)
+                        padded_ids.append(torch.cat([pad_t, ext_ids]))
+                        padded_mask.append(torch.cat([
+                            torch.zeros(pad_len, dtype=torch.long, device=device),
+                            torch.ones(len(ext_ids), dtype=torch.long, device=device),
+                        ]))
+                        padded_pos.append(torch.cat([
+                            torch.zeros(pad_len, dtype=torch.long, device=device),
+                            torch.arange(len(ext_ids), dtype=torch.long, device=device),
+                        ]))
+                    else:
+                        padded_ids.append(ext_ids)
+                        padded_mask.append(torch.ones(len(ext_ids), dtype=torch.long, device=device))
+                        padded_pos.append(torch.arange(len(ext_ids), dtype=torch.long, device=device))
+
+                batch_ids = torch.stack(padded_ids)       # (mb, max_len)
+                batch_mask = torch.stack(padded_mask)      # (mb, max_len)
+                batch_pos = torch.stack(padded_pos)        # (mb, max_len)
+
                 output = ref_model(
-                    input_ids=ext_ids,
-                    attention_mask=ext_mask,
-                    position_ids=ext_pos,
+                    input_ids=batch_ids,
+                    attention_mask=batch_mask,
+                    position_ids=batch_pos,
                     use_cache=False,
                 )
+                logits = output.logits / temperature  # (mb, max_len, vocab)
 
-                logits = output.logits.squeeze(0) / temperature  # (ext_len, vocab)
+                # Extract per-sample results
+                for j, idx in enumerate(mb_indices):
+                    ext_ids_1d, doc_prompt_len, valid_response_len = ext_sequences[idx]
+                    seq_len = len(ext_ids_1d)
+                    pad_offset = max_len - seq_len
 
-                # Extract response logits (shifted for next-token prediction)
-                doc_prompt_len = ext_len - valid_response_len
-                shifted_ids = ext_ids.squeeze(0)[doc_prompt_len:]  # response token ids
-                shifted_logits = logits[doc_prompt_len - 1:-1]  # logits predicting response tokens
+                    # Response region in padded coordinates
+                    resp_start = pad_offset + doc_prompt_len
+                    resp_end = pad_offset + seq_len
 
-                TOP_K = 20  # match the paper's top_k_logits=20
+                    shifted_ids = batch_ids[j, resp_start:resp_end]
+                    shifted_logits = logits[j, resp_start - 1:resp_end - 1]
 
-                if shifted_logits.shape[0] > 0 and shifted_ids.shape[0] > 0:
-                    # Single-token logprob (for the KL penalty path, backward compat)
-                    resp_lp = logprobs_from_logits(logits=shifted_logits, labels=shifted_ids)
+                    if shifted_logits.shape[0] > 0 and shifted_ids.shape[0] > 0:
+                        resp_lp = logprobs_from_logits(logits=shifted_logits, labels=shifted_ids)
+                        log_probs_full = torch.nn.functional.log_softmax(shifted_logits, dim=-1)
+                        topk_lp, topk_id = torch.topk(log_probs_full, k=TOP_K, dim=-1)
+                    else:
+                        resp_lp = torch.zeros(valid_response_len, device=device)
+                        topk_lp = torch.zeros(valid_response_len, TOP_K, device=device)
+                        topk_id = torch.zeros(valid_response_len, TOP_K, dtype=torch.long, device=device)
 
-                    # Top-k logprobs: the paper's distillation target
-                    log_probs_full = torch.nn.functional.log_softmax(shifted_logits, dim=-1)  # (resp_len, vocab)
-                    topk_lp, topk_ids = torch.topk(log_probs_full, k=TOP_K, dim=-1)  # each (resp_len, TOP_K)
-                else:
-                    resp_lp = torch.zeros(valid_response_len, device=device)
-                    topk_lp = torch.zeros(valid_response_len, TOP_K, device=device)
-                    topk_ids = torch.zeros(valid_response_len, TOP_K, dtype=torch.long, device=device)
+                    all_ref_logprobs[idx] = _pad_to(resp_lp, response_length)
+                    all_topk_logprobs[idx] = _pad_to(topk_lp, response_length)
+                    all_topk_ids[idx] = _pad_to(topk_id, response_length)
 
-                # Pad to response_length
-                def _pad_to(t, target_len, pad_val=0):
-                    if t.shape[0] < target_len:
-                        pad_shape = list(t.shape)
-                        pad_shape[0] = target_len - t.shape[0]
-                        t = torch.cat([t, torch.full(pad_shape, pad_val, dtype=t.dtype, device=t.device)])
-                    return t[:target_len]
-
-                all_ref_logprobs.append(_pad_to(resp_lp, response_length))
-                all_topk_logprobs.append(_pad_to(topk_lp, response_length))
-                all_topk_ids.append(_pad_to(topk_ids, response_length))
-
-        ref_log_prob = torch.stack(all_ref_logprobs, dim=0).float().cpu()  # (bs, resp_len)
-        ref_topk_logprobs = torch.stack(all_topk_logprobs, dim=0).float().cpu()  # (bs, resp_len, 20)
-        ref_topk_ids = torch.stack(all_topk_ids, dim=0).long().cpu()  # (bs, resp_len, 20)
-        print(f"[cartridge-ref] Teacher: {teacher_hits}/{batch_size} with docs, mean_lp={ref_log_prob[ref_log_prob != 0].mean():.4f}")
+        ref_log_prob = torch.stack(all_ref_logprobs, dim=0).float().cpu()
+        ref_topk_logprobs = torch.stack(all_topk_logprobs, dim=0).float().cpu()
+        ref_topk_ids = torch.stack(all_topk_ids, dim=0).long().cpu()
+        elapsed = time.time() - t0
+        print(f"[cartridge-ref] Teacher: {teacher_hits}/{batch_size} with docs, "
+              f"mean_lp={ref_log_prob[ref_log_prob != 0].mean():.4f}, "
+              f"{elapsed:.1f}s ({batch_size // TEACHER_MICRO_BATCH + (1 if batch_size % TEACHER_MICRO_BATCH else 0)} micro-batches)")
 
         if self._is_offload_param:
             offload_fsdp_model_to_cpu(ref_model)
