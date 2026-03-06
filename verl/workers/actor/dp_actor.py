@@ -429,72 +429,95 @@ class DataParallelPPOActor(BasePPOActor):
     def _forward_micro_batch_cartridge(
         self, micro_batch: dict[str, torch.Tensor], temperature: float, response_length: int
     ) -> dict[str, torch.Tensor]:
-        """Cartridge-specific forward pass.
+        """Cartridge-specific forward pass using packed sequences.
 
-        FlexLlamaForCausalLM / CacheAndModel takes (input_ids, seq_ids, position_ids)
-        instead of (input_ids, attention_mask, position_ids).  We convert the
-        attention_mask to seq_ids (all tokens belong to sequence 0) and call the
-        wrapped model directly.
+        FlexLlamaForCausalLM uses seq_ids for block-diagonal attention:
+        - Cache tokens have seq_id=-1 → attended by ALL sequences
+        - Real tokens with same seq_id attend to each other (causal)
 
-        When ref_topk_ids is present in the micro_batch, also returns the student's
-        log-probs at the teacher's top-k positions (for top-k distillation loss).
+        We pack all samples into a single 1D sequence, assign each sample a
+        different seq_id, and do ONE forward pass.  This replaces the old
+        per-sample loop that did N serial forward passes.
+
+        When ref_topk_ids is present, also returns student log-probs at the
+        teacher's top-k positions (for top-k distillation loss).
         """
         import torch.nn.functional as F
 
-        # Teacher top-k token IDs (if available for distillation)
         ref_topk_ids = micro_batch.get("ref_topk_ids", None)  # (bs, resp_len, K) or None
         TOP_K = ref_topk_ids.shape[-1] if ref_topk_ids is not None else 0
 
         with torch.autocast(device_type=self.device_name, dtype=self.param_dtype):
-            input_ids = micro_batch["input_ids"]  # (bs, seqlen)
-            batch_size, seqlen = input_ids.shape
+            input_ids = micro_batch["input_ids"]      # (bs, seqlen)
             attention_mask = micro_batch["attention_mask"]
-            position_ids = micro_batch["position_ids"]
+            batch_size, seqlen = input_ids.shape
+            device = input_ids.device
 
+            # --- Step 1: Extract valid tokens per sample and record offsets ---
+            packed_ids_list = []
+            packed_seq_ids_list = []
+            packed_pos_ids_list = []
+            sample_info = []  # (offset_in_packed, valid_len, prompt_len)
+
+            offset = 0
+            for i in range(batch_size):
+                mask_i = attention_mask[i].bool()
+                ids_i = input_ids[i][mask_i]
+                valid_len = ids_i.shape[0]
+                prompt_len = valid_len - response_length
+
+                packed_ids_list.append(ids_i)
+                packed_seq_ids_list.append(torch.full((valid_len,), i, dtype=torch.long, device=device))
+                packed_pos_ids_list.append(torch.arange(valid_len, dtype=torch.long, device=device))
+                sample_info.append((offset, valid_len, prompt_len))
+                offset += valid_len
+
+            packed_ids = torch.cat(packed_ids_list)       # (total_tokens,)
+            packed_seq_ids = torch.cat(packed_seq_ids_list)
+            packed_pos_ids = torch.cat(packed_pos_ids_list)
+
+            # --- Step 2: Clear cache, single packed forward pass ---
+            cache_obj = None
+            if hasattr(self.actor_module, "cache"):
+                cache_obj = self.actor_module.cache
+            elif hasattr(self.actor_module, "module") and hasattr(self.actor_module.module, "cache"):
+                cache_obj = self.actor_module.module.cache
+            if cache_obj is not None:
+                cache_obj.clear()
+
+            output = self.actor_module(
+                input_ids=packed_ids,
+                seq_ids=packed_seq_ids,
+                position_ids=packed_pos_ids,
+            )
+            all_logits = output.logits.squeeze(0) / temperature  # (total_tokens, vocab)
+
+            # --- Step 3: Slice per-sample results from the packed output ---
             all_log_probs = []
             all_student_topk = [] if TOP_K > 0 else None
 
             for i in range(batch_size):
-                mask_i = attention_mask[i].bool()
-                ids_i = input_ids[i][mask_i]  # (valid_len,)
-                valid_len = ids_i.shape[0]
+                start, valid_len, prompt_len = sample_info[i]
+                end = start + valid_len
 
-                seq_ids_i = torch.zeros(valid_len, dtype=torch.long, device=ids_i.device)
-                pos_ids_i = torch.arange(valid_len, dtype=torch.long, device=ids_i.device)
-
-                # Clear cache state from previous sample
-                cache_obj = None
-                if hasattr(self.actor_module, "cache"):
-                    cache_obj = self.actor_module.cache
-                elif hasattr(self.actor_module, "module") and hasattr(self.actor_module.module, "cache"):
-                    cache_obj = self.actor_module.module.cache
-                if cache_obj is not None:
-                    cache_obj.clear()
-
-                output = self.actor_module(
-                    input_ids=ids_i,
-                    seq_ids=seq_ids_i,
-                    position_ids=pos_ids_i,
-                )
-
-                logits = output.logits.squeeze(0) / temperature  # (valid_len, vocab)
+                logits_i = all_logits[start:end]          # (valid_len, vocab)
+                ids_i = packed_ids[start:end]
 
                 # Shift for next-token prediction
+                shifted_logits = logits_i[:-1]            # (valid_len-1, vocab)
                 shifted_ids = ids_i[1:]
-                shifted_logits = logits[:-1]  # (valid_len-1, vocab)
 
                 log_probs_i = logprobs_from_logits(logits=shifted_logits, labels=shifted_ids)
 
                 # Extract response portion
-                prompt_token_count = valid_len - response_length
-                resp_start = max(0, prompt_token_count - 1)
+                resp_start = max(0, prompt_len - 1)
                 resp_log_probs = log_probs_i[resp_start:]
 
                 # Pad to response_length
                 if resp_log_probs.shape[0] < response_length:
                     pad = torch.zeros(
                         response_length - resp_log_probs.shape[0],
-                        device=resp_log_probs.device, dtype=resp_log_probs.dtype,
+                        device=device, dtype=resp_log_probs.dtype,
                     )
                     resp_log_probs = torch.cat([resp_log_probs, pad])
                 else:
@@ -503,22 +526,20 @@ class DataParallelPPOActor(BasePPOActor):
 
                 # Top-k student logprobs at teacher's token positions
                 if TOP_K > 0:
-                    resp_logits = shifted_logits[resp_start:]  # (resp_actual, vocab)
+                    resp_logits = shifted_logits[resp_start:]
                     resp_actual = resp_logits.shape[0]
-                    log_probs_full = F.log_softmax(resp_logits, dim=-1)  # (resp_actual, vocab)
+                    log_probs_full = F.log_softmax(resp_logits, dim=-1)
 
                     topk_ids_i = ref_topk_ids[i]  # (response_length, K)
-                    # Gather student logprobs at teacher's top-k positions
                     actual_len = min(resp_actual, response_length)
                     student_topk_i = log_probs_full[:actual_len].gather(
-                        -1, topk_ids_i[:actual_len].to(log_probs_full.device)
-                    )  # (actual_len, K)
+                        -1, topk_ids_i[:actual_len].to(device)
+                    )
 
-                    # Pad to response_length
                     if actual_len < response_length:
                         pad = torch.zeros(
                             response_length - actual_len, TOP_K,
-                            device=student_topk_i.device, dtype=student_topk_i.dtype,
+                            device=device, dtype=student_topk_i.dtype,
                         )
                         student_topk_i = torch.cat([student_topk_i, pad], dim=0)
                     all_student_topk.append(student_topk_i)
@@ -528,7 +549,7 @@ class DataParallelPPOActor(BasePPOActor):
         result = {"log_probs": log_probs}
         result["entropys"] = torch.zeros_like(log_probs)
         if all_student_topk is not None:
-            result["student_topk_logprobs"] = torch.stack(all_student_topk, dim=0)  # (bs, resp_len, K)
+            result["student_topk_logprobs"] = torch.stack(all_student_topk, dim=0)
         return result
 
     @GPUMemoryLogger(role="dp actor", logger=logger)
