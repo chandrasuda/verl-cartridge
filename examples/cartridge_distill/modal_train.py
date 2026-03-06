@@ -37,7 +37,7 @@ image = (
     )
     # Install veRL from our fork (has cartridge support baked in)
     # Cache bust: change the echo to force re-clone on code changes
-    .run_commands("echo 'verl-fork-v11-inline-eval'")
+    .run_commands("echo 'verl-fork-v14-2step-eval'")
     .run_commands(
         "git clone https://github.com/chandrasuda/verl-cartridge.git /opt/verl-cartridge "
         "&& pip install -e /opt/verl-cartridge"
@@ -117,9 +117,10 @@ def train():
     with open("/tmp/reward/dummy_reward.py", "w") as f:
         f.write("def compute_score(data_source, solution_str, ground_truth, extra_info=None):\n    return 0.0\n")
 
-    # Run training
+    # Run training — unbuffered so every log line streams immediately
     env = os.environ.copy()
     env["TOKASAURUS_URL"] = TOKASAURUS_URL
+    env["PYTHONUNBUFFERED"] = "1"
 
     cmd = [
         sys.executable, "-m", "verl.trainer.main_ppo",
@@ -132,6 +133,7 @@ def train():
         "data.max_response_length=512",
         "data.filter_overlong_prompts=True",
         "data.truncation=right",
+        "data.shuffle=False",  # keep patient-sorted order for patient-grouped batches
         #
         "actor_rollout_ref.model.path=meta-llama/Llama-3.2-3B-Instruct",
         "actor_rollout_ref.model.external_lib=cartridges",
@@ -183,7 +185,7 @@ def train():
         "+trainer.cartridge_save_freq=10",  # Save cache .pt every 10 steps so we can eval early
         "trainer.default_local_dir=/results/onpolicy",
         "trainer.total_epochs=100",  # Large — actual limit is total_training_steps below
-        "trainer.total_training_steps=300",  # ~15 hours at ~180s/step
+        "trainer.total_training_steps=2",  # 2-step run: eval at step 0 and after step 2
         "trainer.val_before_train=False",
     ]
 
@@ -193,8 +195,14 @@ def train():
     print(f"GPU: {GPU}")
     print(f"{'='*60}\n")
 
-    result = subprocess.run(cmd, env=env)
+    import time as _time
+    train_start = _time.time()
+    print(f"[{_time.strftime('%H:%M:%S')}] Training subprocess starting...")
+    result = subprocess.run(cmd, env=env, stdout=sys.stdout, stderr=sys.stderr)
     
+    train_elapsed = _time.time() - train_start
+    print(f"\n[{_time.strftime('%H:%M:%S')}] Training took {train_elapsed/60:.1f} min ({train_elapsed:.0f}s)")
+
     if result.returncode != 0:
         print(f"Training failed with exit code {result.returncode}")
         return result.returncode
@@ -236,8 +244,11 @@ def train():
 def _eval_all_checkpoints(ckpt_dir: str):
     """Evaluate all cartridge checkpoints on LongHealth after training.
 
-    Loads FlexLlama + each cache checkpoint, runs 40 MC questions,
-    and saves accuracy curve to /results/onpolicy_eval.json.
+    Matches the working pattern from quick_eval.py:
+    - Baseline uses standard AutoModelForCausalLM (FlexLlama doesn't support .generate())
+    - Cartridge eval uses FlexLlamaForCausalLM + flex_generate with 1D input_ids, seq_ids, position_ids
+    - flex_generate returns dict {seq_id: [token_ids]}, not a tensor
+    - Manual cache reconstruction to work around from_pretrained bug with num_frozen_tokens
     """
     import glob
     import json
@@ -247,9 +258,9 @@ def _eval_all_checkpoints(ckpt_dir: str):
     import requests as http_req
 
     import torch
-    from transformers import AutoTokenizer
+    from transformers import AutoTokenizer, AutoModelForCausalLM
     from cartridges.models.llama.modeling_llama import FlexLlamaForCausalLM
-    from cartridges.cache import TrainableCache
+    from cartridges.cache import TrainableCache, AttnConfig
     from cartridges.generation import flex_generate
 
     NUM_EVAL = 40
@@ -260,9 +271,14 @@ def _eval_all_checkpoints(ckpt_dir: str):
         print("[eval] No checkpoints found, skipping eval")
         return
 
+    # Log checkpoint sizes to confirm they're clean (~224 MB each)
     print(f"\n{'='*60}")
     print(f"EVALUATING {len(ckpts)} CHECKPOINTS ON LONGHEALTH")
-    print(f"{'='*60}\n")
+    print(f"{'='*60}")
+    for c in ckpts:
+        sz_mb = os.path.getsize(c) / 1e6
+        print(f"  {os.path.basename(c):>30s}  {sz_mb:.1f} MB")
+    print()
 
     # Load LongHealth questions
     data = http_req.get(
@@ -292,56 +308,98 @@ def _eval_all_checkpoints(ckpt_dir: str):
         m = re.search(r'\b([A-E])\b', text.strip()[:20])
         return m.group(1) if m else "?"
 
-    # Load model + tokenizer
-    print(f"Loading {MODEL}...")
     tokenizer = AutoTokenizer.from_pretrained(MODEL)
-    model = FlexLlamaForCausalLM.from_pretrained(MODEL, torch_dtype=torch.bfloat16).cuda().eval()
-    print("✓ Model loaded")
 
-    # Baseline eval (no cartridge)
-    print("\n--- Baseline (no cartridge) ---")
+    # ---- Baseline eval (no cartridge) — uses standard Llama, NOT FlexLlama ----
+    print(f"\n--- Baseline (no cartridge) ---")
+    print(f"  Loading standard AutoModelForCausalLM...")
+    base_model = AutoModelForCausalLM.from_pretrained(MODEL, torch_dtype=torch.bfloat16).cuda().eval()
     correct_bl = 0
-    for q in eval_qs:
+    for i, q in enumerate(eval_qs):
         ids = tokenizer.encode(q["prompt"], return_tensors="pt").cuda()
         with torch.no_grad():
-            out = model.generate(ids, max_new_tokens=10, do_sample=False)
-        pred = extract_answer(tokenizer.decode(out[0][ids.shape[1]:], skip_special_tokens=True))
+            out = base_model.generate(ids, max_new_tokens=10, do_sample=False)
+        gen_text = tokenizer.decode(out[0][ids.shape[1]:], skip_special_tokens=True)
+        pred = extract_answer(gen_text)
+        if i < 3:
+            print(f"    Q{i}: gen='{gen_text[:60]}' pred={pred} correct={q['correct']}")
         if pred == q["correct"]:
             correct_bl += 1
     baseline_acc = correct_bl / len(eval_qs) * 100
     print(f"  Baseline: {correct_bl}/{len(eval_qs)} ({baseline_acc:.1f}%)")
+    del base_model
+    torch.cuda.empty_cache()
 
-    # Eval each checkpoint
+    # ---- Load FlexLlama for cartridge eval ----
+    print(f"\n  Loading FlexLlamaForCausalLM for cartridge eval...")
+    flex_model = FlexLlamaForCausalLM.from_pretrained(MODEL, torch_dtype=torch.bfloat16).cuda().eval()
+    print(f"  ✓ FlexLlama loaded")
+
     results = {
         "baseline": {"correct": correct_bl, "total": len(eval_qs), "accuracy": baseline_acc},
         "evals": [],
     }
 
     for ckpt_path in ckpts:
-        m = re.search(r"cache-step(\d+)\.pt", ckpt_path)
-        if not m:
+        m_step = re.search(r"cache-step(\d+)\.pt", ckpt_path)
+        if not m_step:
             continue
-        step = int(m.group(1))
+        step = int(m_step.group(1))
 
         print(f"\n--- Step {step} ---")
         try:
+            # Fix legacy key names
             ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
             if "fixed_keys" in ckpt and "frozen_keys" not in ckpt:
                 ckpt["frozen_keys"] = ckpt.pop("fixed_keys")
                 ckpt["frozen_values"] = ckpt.pop("fixed_values")
                 torch.save(ckpt, ckpt_path)
+                ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+
+            # Manual cache reconstruction (works around from_pretrained bug with num_frozen_tokens)
+            trainable_keys = ckpt["trainable_keys"]
+            frozen_keys = ckpt["frozen_keys"]
+            n_layers = len(trainable_keys)
+            n_heads = trainable_keys[0].size(1)
+            head_dim = trainable_keys[0].size(3)
+            num_frozen = frozen_keys[0].size(2) if frozen_keys else 0
+            num_trainable = trainable_keys[0].size(2)
+            print(f"  Cache: {n_layers} layers, {n_heads} heads, {num_trainable} trainable + {num_frozen} frozen tokens")
+
+            init_keys = [
+                torch.cat([frozen_keys[i], trainable_keys[i]], dim=2).contiguous()
+                if num_frozen > 0 else trainable_keys[i]
+                for i in range(n_layers)
+            ]
+            init_values = [
+                torch.cat([ckpt["frozen_values"][i], ckpt["trainable_values"][i]], dim=2).contiguous()
+                if num_frozen > 0 else ckpt["trainable_values"][i]
+                for i in range(n_layers)
+            ]
+            cache = TrainableCache(
+                config=AttnConfig(n_layers=n_layers, n_heads=n_heads, head_dim=head_dim),
+                init_keys=init_keys, init_values=init_values,
+                num_frozen_tokens=num_frozen,
+            ).cuda()
             del ckpt
 
-            cache = TrainableCache.from_pretrained(ckpt_path).cuda()
             correct = 0
-            for q in eval_qs:
-                ids = tokenizer.encode(q["prompt"], return_tensors="pt").cuda()
+            for qi, q in enumerate(eval_qs):
+                ids = tokenizer.encode(q["prompt"])
+                input_ids = torch.tensor(ids, dtype=torch.long, device="cuda")  # 1D
+                seq_ids = torch.zeros_like(input_ids)
+                position_ids = torch.arange(len(ids), dtype=torch.long, device="cuda")
                 cache.clear()
-                out_ids = flex_generate(
-                    model=model, tokenizer=tokenizer, cache=cache,
-                    input_ids=ids, max_new_tokens=10, temperature=0.0,
+                gen_output = flex_generate(
+                    model=flex_model, tokenizer=tokenizer, cache=cache,
+                    input_ids=input_ids, seq_ids=seq_ids, position_ids=position_ids,
+                    max_new_tokens=10, temperature=0.0,
                 )
-                pred = extract_answer(tokenizer.decode(out_ids[0][ids.shape[1]:], skip_special_tokens=True))
+                gen_tokens = gen_output.get(0, [])
+                gen_text = tokenizer.decode(gen_tokens, skip_special_tokens=True)
+                pred = extract_answer(gen_text)
+                if qi < 3:
+                    print(f"    Q{qi}: gen='{gen_text[:80]}' pred={pred} correct={q['correct']}")
                 if pred == q["correct"]:
                     correct += 1
 
@@ -352,7 +410,12 @@ def _eval_all_checkpoints(ckpt_dir: str):
             del cache
             torch.cuda.empty_cache()
         except Exception as e:
+            import traceback
             print(f"  ✗ Step {step} failed: {e}")
+            traceback.print_exc()
+
+    del flex_model
+    torch.cuda.empty_cache()
 
     # Save results
     eval_path = "/results/onpolicy_eval.json"
@@ -368,80 +431,6 @@ def _eval_all_checkpoints(ckpt_dir: str):
     for e in sorted(results["evals"], key=lambda x: x["step"]):
         print(f"  Step {e['step']:>4}:  {e['accuracy']:.1f}%")
     print(f"{'='*60}")
-
-
-@app.function(
-    gpu="A10G",
-    secrets=[modal.Secret.from_name("huggingface-secret")],
-    timeout=1800,
-    volumes={"/results": results_volume},
-)
-def eval_cartridge():
-    """Evaluate on-policy cartridge on LongHealth."""
-    import torch
-    import json
-    import re
-    import requests as http_req
-
-    print("Loading model + cartridge...")
-    from transformers import AutoTokenizer, AutoModelForCausalLM
-    from cartridges.cache import TrainableCache
-
-    tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-3.2-3B-Instruct")
-    model = AutoModelForCausalLM.from_pretrained(
-        "meta-llama/Llama-3.2-3B-Instruct", torch_dtype=torch.bfloat16
-    ).cuda().eval()
-
-    # Load on-policy cartridge
-    ckpt_path = "/results/onpolicy/on_policy_cartridge_final.pt"
-    import os
-    if os.path.exists(ckpt_path):
-        # Rename fixed_keys if needed
-        ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-        if "fixed_keys" in ckpt and "frozen_keys" not in ckpt:
-            ckpt["frozen_keys"] = ckpt.pop("fixed_keys")
-            ckpt["frozen_values"] = ckpt.pop("fixed_values")
-            torch.save(ckpt, ckpt_path + ".fixed")
-            ckpt_path = ckpt_path + ".fixed"
-        del ckpt
-        cartridge = TrainableCache.from_pretrained(ckpt_path).cuda()
-        print(f"✓ Loaded on-policy cartridge: {cartridge._num_trainable_tokens} trainable tokens")
-    else:
-        print(f"⚠ No cartridge found at {ckpt_path}")
-        return
-
-    # Load LongHealth questions
-    data = http_req.get("https://raw.githubusercontent.com/kbressem/LongHealth/refs/heads/main/data/benchmark_v5.json").json()
-
-    questions = []
-    for pid, patient in data.items():
-        if int(pid.split("_")[1]) > 8: continue
-        for q in patient["questions"]:
-            options = f"A) {q['answer_a']}\nB) {q['answer_b']}\nC) {q['answer_c']}\nD) {q['answer_d']}\nE) {q['answer_e']}"
-            answer_map = {q["answer_a"]: "A", q["answer_b"]: "B", q["answer_c"]: "C", q["answer_d"]: "D", q["answer_e"]: "E"}
-            correct = answer_map.get(q["correct"], "?")
-            prompt = f"Question about patient {patient['name']}:\n{q['question']}\nOptions:\n{options}\nAnswer (A/B/C/D/E):"
-            questions.append({"prompt": prompt, "correct": correct})
-
-    print(f"Evaluating {len(questions[:40])} questions...")
-
-    # We can't easily eval with cartridge locally (needs FlexLlama)
-    # But we can eval baseline without cartridge
-    correct_baseline = 0
-    for q in questions[:40]:
-        ids = tokenizer.encode(q["prompt"], return_tensors="pt").cuda()
-        with torch.no_grad():
-            out = model.generate(ids, max_new_tokens=5, temperature=0.0, do_sample=False)
-        answer = tokenizer.decode(out[0][ids.shape[1]:], skip_special_tokens=True)
-        m = re.search(r'\b([A-E])\b', answer[:20])
-        pred = m.group(1) if m else "?"
-        if pred == q["correct"]:
-            correct_baseline += 1
-
-    print(f"\nBaseline (no cartridge): {correct_baseline}/40 ({correct_baseline/40*100:.1f}%)")
-    print(f"On-policy cartridge saved at: {ckpt_path}")
-    print("Note: eval WITH cartridge requires FlexLlamaForCausalLM which needs FlexAttention setup.")
-    print("Use Tokasaurus for cartridge eval (upload the .pt file to HuggingFace or pass as local).")
 
 
 @app.local_entrypoint()

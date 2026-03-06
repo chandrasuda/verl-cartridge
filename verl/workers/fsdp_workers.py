@@ -1347,90 +1347,94 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         t0 = time.time()
 
-        # --- Phase 1: Build all extended sequences ---
-        ext_sequences = []  # list of (ext_ids_1d, doc_prompt_len, valid_response_len)
+        # -----------------------------------------------------------------------
+        # Prefix KV optimization: if all samples are the same patient, compute
+        # the document KV cache ONCE and reuse it via past_key_values.
+        # This reduces teacher tokens by ~14× (12K + 32×500 vs 32×12.5K).
+        # -----------------------------------------------------------------------
+        def _expand_kv(kv_cache, mb_size):
+            """Expand a batch-1 DynamicCache to batch mb_size (read-only view)."""
+            from transformers.cache_utils import DynamicCache
+            out = DynamicCache()
+            for k, v in zip(kv_cache.key_cache, kv_cache.value_cache):
+                out.key_cache.append(k.expand(mb_size, -1, -1, -1).contiguous())
+                out.value_cache.append(v.expand(mb_size, -1, -1, -1).contiguous())
+            return out
+
+        def _detect_shared_patient(data, batch_size):
+            """Return (patient_id, doc_ids_list) if all samples are same patient."""
+            if "patient_id" in data.non_tensor_batch:
+                all_pids = [str(data.non_tensor_batch["patient_id"][i]) for i in range(batch_size)]
+                if len(set(all_pids)) == 1 and all_pids[0] in self._patient_doc_ids:
+                    return all_pids[0], self._patient_doc_ids[all_pids[0]]
+            # fallback: try to match by name in first sample's prompt
+            attn = data.batch["attention_mask"][0]
+            ids0 = data.batch["input_ids"][0][attn.bool()]
+            text0 = self.tokenizer.decode(ids0.tolist(), skip_special_tokens=True)
+            for pid, pname in self._patient_names.items():
+                if pname and pname in text0:
+                    return pid, self._patient_doc_ids[pid]
+            return None, []
+
+        shared_pid, shared_doc_ids = _detect_shared_patient(data, batch_size)
+        shared_doc_kv = None
+        shared_doc_len = 0
+        use_prefix = False
+
+        if shared_doc_ids:
+            doc_t = torch.tensor(shared_doc_ids, dtype=torch.long, device=device).unsqueeze(0)
+            with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                doc_out = ref_model(doc_t, use_cache=True)
+            shared_doc_kv = doc_out.past_key_values
+            shared_doc_len = len(shared_doc_ids)
+            use_prefix = True
+            print(f"[cartridge-ref] Prefix opt: patient={shared_pid}, doc_len={shared_doc_len} "
+                  f"→ teacher processes only prompt+response per sample")
+
+        # --- Phase 1: Build per-sample sequences (prompt+response only if prefix) ---
+        ext_sequences = []  # (sample_ids_1d, prompt_len_in_sample, valid_response_len)
         teacher_hits = 0
 
         for i in range(batch_size):
             attention_mask = data.batch["attention_mask"][i]
-            input_ids = data.batch["input_ids"][i]
-            valid_ids = input_ids[attention_mask.bool()]
+            input_ids_i = data.batch["input_ids"][i]
+            valid_ids = input_ids_i[attention_mask.bool()]
             response_mask = data.batch["response_mask"][i]
             valid_response_len = int(response_mask.sum().item())
 
-            # Look up document — try multiple strategies for patient_id
-            doc_ids_list = []
-            matched = False
-            pid = None
-            match_strategy = None
+            if use_prefix:
+                # No doc tokens in the input — they're in past_key_values
+                sample_ids = valid_ids.to(device)
+                prompt_len = len(sample_ids) - valid_response_len
+                teacher_hits += 1
+            else:
+                # Fallback: try per-sample document lookup + concatenation
+                doc_ids_list = []
+                matched = False
 
-            # Strategy 1: patient_id as top-level non_tensor field
-            if not matched and "patient_id" in data.non_tensor_batch:
-                pid = str(data.non_tensor_batch["patient_id"][i])
-                if pid in self._patient_doc_ids:
-                    doc_ids_list = self._patient_doc_ids[pid]
-                    matched = True
-                    match_strategy = "top-level"
-                    teacher_hits += 1
-
-            # Strategy 2: patient_id inside extra_info
-            if not matched and "extra_info" in data.non_tensor_batch:
-                ei = data.non_tensor_batch["extra_info"][i]
-                if isinstance(ei, dict) and "patient_id" in ei:
-                    pid = str(ei["patient_id"])
+                if "patient_id" in data.non_tensor_batch:
+                    pid = str(data.non_tensor_batch["patient_id"][i])
                     if pid in self._patient_doc_ids:
                         doc_ids_list = self._patient_doc_ids[pid]
                         matched = True
-                        match_strategy = "extra_info"
                         teacher_hits += 1
 
-            # Strategy 3: name matching on raw_prompt (survives veRL pipeline intact)
-            if not matched and "raw_prompt" in data.non_tensor_batch:
-                rp = data.non_tensor_batch["raw_prompt"][i]
-                rp_text = ""
-                if isinstance(rp, list):
-                    rp_text = " ".join(m.get("content", "") for m in rp if isinstance(m, dict))
-                elif isinstance(rp, str):
-                    rp_text = rp
-                for pid_candidate, pname in self._patient_names.items():
-                    if pname and pname in rp_text:
-                        doc_ids_list = self._patient_doc_ids[pid_candidate]
-                        matched = True
-                        match_strategy = "raw_prompt"
-                        teacher_hits += 1
-                        break
+                if not matched:
+                    prompt_text = self.tokenizer.decode(valid_ids.tolist(), skip_special_tokens=True)
+                    for pid_c, pname in self._patient_names.items():
+                        if pname and pname in prompt_text:
+                            doc_ids_list = self._patient_doc_ids[pid_c]
+                            teacher_hits += 1
+                            break
 
-            # Strategy 4: name matching on decoded token ids (broadest search)
-            if not matched:
-                prompt_text = self.tokenizer.decode(valid_ids.tolist(), skip_special_tokens=True)
-                for pid_candidate, pname in self._patient_names.items():
-                    if pname and pname in prompt_text:
-                        doc_ids_list = self._patient_doc_ids[pid_candidate]
-                        teacher_hits += 1
-                        matched = True
-                        match_strategy = "decoded_text"
-                        break
+                if doc_ids_list:
+                    doc_t1 = torch.tensor(doc_ids_list, dtype=torch.long, device=device)
+                    sample_ids = torch.cat([doc_t1, valid_ids.to(device)])
+                else:
+                    sample_ids = valid_ids.to(device)
+                prompt_len = len(sample_ids) - valid_response_len
 
-            if not matched and i == 0:
-                available_keys = list(data.non_tensor_batch.keys()) if data.non_tensor_batch else []
-                ei_sample = data.non_tensor_batch.get("extra_info", [None])[0]
-                rp_sample = str(data.non_tensor_batch.get("raw_prompt", [None])[0])[:200]
-                print(f"[cartridge-ref] NO MATCH for sample 0.")
-                print(f"  non_tensor keys: {available_keys}")
-                print(f"  extra_info type={type(ei_sample).__name__} val={str(ei_sample)[:200]}")
-                print(f"  raw_prompt[:200]: {rp_sample}")
-
-            if i == 0 and matched:
-                print(f"[cartridge-ref] Sample 0 matched via '{match_strategy}' → {pid}")
-
-            if doc_ids_list:
-                doc_tensor = torch.tensor(doc_ids_list, dtype=torch.long, device=device)
-                ext_ids = torch.cat([doc_tensor, valid_ids.to(device)])
-            else:
-                ext_ids = valid_ids.to(device)
-
-            doc_prompt_len = len(ext_ids) - valid_response_len
-            ext_sequences.append((ext_ids, doc_prompt_len, valid_response_len))
+            ext_sequences.append((sample_ids, prompt_len, valid_response_len))
 
         # --- Phase 2: Batched forward passes in micro-batches ---
         all_ref_logprobs = [None] * batch_size
@@ -1449,52 +1453,62 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 mb_end = min(mb_start + TEACHER_MICRO_BATCH, batch_size)
                 mb_indices = list(range(mb_start, mb_end))
                 mb_seqs = [ext_sequences[i] for i in mb_indices]
+                mb_size = len(mb_seqs)
 
-                # Pad to max length in this micro-batch
                 max_len = max(len(s[0]) for s in mb_seqs)
-                padded_ids = []
-                padded_mask = []
-                padded_pos = []
+                padded_ids, padded_mask, padded_pos = [], [], []
 
-                for ext_ids, _, _ in mb_seqs:
-                    pad_len = max_len - len(ext_ids)
-                    # Left-pad so response tokens are right-aligned
+                for sample_ids, _, _ in mb_seqs:
+                    pad_len = max_len - len(sample_ids)
+                    pos_start = shared_doc_len if use_prefix else 0
                     if pad_len > 0:
                         pad_t = torch.zeros(pad_len, dtype=torch.long, device=device)
-                        padded_ids.append(torch.cat([pad_t, ext_ids]))
+                        padded_ids.append(torch.cat([pad_t, sample_ids]))
                         padded_mask.append(torch.cat([
                             torch.zeros(pad_len, dtype=torch.long, device=device),
-                            torch.ones(len(ext_ids), dtype=torch.long, device=device),
+                            torch.ones(len(sample_ids), dtype=torch.long, device=device),
                         ]))
                         padded_pos.append(torch.cat([
                             torch.zeros(pad_len, dtype=torch.long, device=device),
-                            torch.arange(len(ext_ids), dtype=torch.long, device=device),
+                            torch.arange(pos_start, pos_start + len(sample_ids), dtype=torch.long, device=device),
                         ]))
                     else:
-                        padded_ids.append(ext_ids)
-                        padded_mask.append(torch.ones(len(ext_ids), dtype=torch.long, device=device))
-                        padded_pos.append(torch.arange(len(ext_ids), dtype=torch.long, device=device))
+                        padded_ids.append(sample_ids)
+                        padded_mask.append(torch.ones(len(sample_ids), dtype=torch.long, device=device))
+                        padded_pos.append(torch.arange(pos_start, pos_start + len(sample_ids), dtype=torch.long, device=device))
 
-                batch_ids = torch.stack(padded_ids)       # (mb, max_len)
-                batch_mask = torch.stack(padded_mask)      # (mb, max_len)
-                batch_pos = torch.stack(padded_pos)        # (mb, max_len)
+                batch_ids = torch.stack(padded_ids)   # (mb, max_len)
+                batch_mask = torch.stack(padded_mask)  # (mb, max_len)
+                batch_pos = torch.stack(padded_pos)    # (mb, max_len)
 
-                output = ref_model(
-                    input_ids=batch_ids,
-                    attention_mask=batch_mask,
-                    position_ids=batch_pos,
-                    use_cache=False,
-                )
+                if use_prefix:
+                    # Extend attention mask to cover doc prefix (all attended)
+                    doc_prefix_mask = torch.ones(mb_size, shared_doc_len, dtype=torch.long, device=device)
+                    full_mask = torch.cat([doc_prefix_mask, batch_mask], dim=1)
+                    expanded_kv = _expand_kv(shared_doc_kv, mb_size)
+                    output = ref_model(
+                        input_ids=batch_ids,
+                        attention_mask=full_mask,
+                        position_ids=batch_pos,
+                        past_key_values=expanded_kv,
+                        use_cache=False,
+                    )
+                else:
+                    output = ref_model(
+                        input_ids=batch_ids,
+                        attention_mask=batch_mask,
+                        position_ids=batch_pos,
+                        use_cache=False,
+                    )
+
                 logits = output.logits / temperature  # (mb, max_len, vocab)
 
-                # Extract per-sample results
                 for j, idx in enumerate(mb_indices):
-                    ext_ids_1d, doc_prompt_len, valid_response_len = ext_sequences[idx]
-                    seq_len = len(ext_ids_1d)
+                    sample_ids_1d, prompt_len, valid_response_len = ext_sequences[idx]
+                    seq_len = len(sample_ids_1d)
                     pad_offset = max_len - seq_len
 
-                    # Response region in padded coordinates
-                    resp_start = pad_offset + doc_prompt_len
+                    resp_start = pad_offset + prompt_len
                     resp_end = pad_offset + seq_len
 
                     shifted_ids = batch_ids[j, resp_start:resp_end]
@@ -1517,9 +1531,9 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         ref_topk_logprobs = torch.stack(all_topk_logprobs, dim=0).float().cpu()
         ref_topk_ids = torch.stack(all_topk_ids, dim=0).long().cpu()
         elapsed = time.time() - t0
-        print(f"[cartridge-ref] Teacher: {teacher_hits}/{batch_size} with docs, "
-              f"mean_lp={ref_log_prob[ref_log_prob != 0].mean():.4f}, "
-              f"{elapsed:.1f}s ({batch_size // TEACHER_MICRO_BATCH + (1 if batch_size % TEACHER_MICRO_BATCH else 0)} micro-batches)")
+        mode = f"prefix(doc={shared_doc_len})" if use_prefix else "full-concat"
+        print(f"[cartridge-ref] Teacher: {teacher_hits}/{batch_size} with docs [{mode}], "
+              f"mean_lp={ref_log_prob[ref_log_prob != 0].mean():.4f}, {elapsed:.1f}s")
 
         if self._is_offload_param:
             offload_fsdp_model_to_cpu(ref_model)

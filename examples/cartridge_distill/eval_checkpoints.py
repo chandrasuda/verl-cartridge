@@ -94,60 +94,34 @@ def evaluate(poll: bool = False):
     print(f"Evaluating {len(eval_qs)} questions per checkpoint\n")
 
     # --- Load model + tokenizer once ---
-    print("Loading model...")
-    from transformers import AutoTokenizer
+    print("Loading models...")
+    from transformers import AutoTokenizer, AutoModelForCausalLM
     from cartridges.models.llama.modeling_llama import FlexLlamaForCausalLM
     from cartridges.cache import TrainableCache
     from cartridges.generation import flex_generate
 
     MODEL = "meta-llama/Llama-3.2-3B-Instruct"
     tokenizer = AutoTokenizer.from_pretrained(MODEL)
-    model = FlexLlamaForCausalLM.from_pretrained(MODEL, torch_dtype=torch.bfloat16).cuda().eval()
-    print(f"✓ Model loaded: {MODEL}\n")
+    if tokenizer.pad_token_id is None:
+        tokenizer.pad_token_id = tokenizer.eos_token_id
+    print(f"✓ Tokenizer loaded: {MODEL}\n")
 
     def extract_answer(text):
         match = re.search(r'\b([A-E])\b', text.strip()[:20])
         return match.group(1) if match else "?"
 
-    def eval_with_cartridge(cache, label=""):
-        """Evaluate using FlexLlama + cartridge (same as off-policy eval)."""
-        correct = 0
-        total = 0
-        for q in eval_qs:
-            try:
-                input_ids = tokenizer.encode(q["prompt"], return_tensors="pt").cuda()
-                cache.clear()
-                output_ids = flex_generate(
-                    model=model,
-                    tokenizer=tokenizer,
-                    cache=cache,
-                    input_ids=input_ids,
-                    max_new_tokens=10,
-                    temperature=0.0,
-                )
-                answer_text = tokenizer.decode(output_ids[0][input_ids.shape[1]:], skip_special_tokens=True)
-                predicted = extract_answer(answer_text)
-                if predicted == q["correct"]:
-                    correct += 1
-                total += 1
-            except Exception as e:
-                if total < 3:
-                    print(f"  ⚠ {e}")
-                total += 1
-
-        acc = correct / total * 100 if total > 0 else 0
-        print(f"  {label}: {correct}/{total} ({acc:.1f}%)")
-        return {"correct": correct, "total": total, "accuracy": acc}
-
-    def eval_baseline():
-        """Evaluate without cartridge (no document context)."""
+    # --- Eval functions ---
+    def run_baseline_eval():
+        """Eval with standard Llama (no cartridge)."""
+        print("  Loading standard LlamaForCausalLM...")
+        std_model = AutoModelForCausalLM.from_pretrained(MODEL, torch_dtype=torch.bfloat16).cuda().eval()
         correct = 0
         total = 0
         for q in eval_qs:
             try:
                 input_ids = tokenizer.encode(q["prompt"], return_tensors="pt").cuda()
                 with torch.no_grad():
-                    out = model.generate(input_ids, max_new_tokens=10, do_sample=False)
+                    out = std_model.generate(input_ids, max_new_tokens=10, do_sample=False)
                 answer_text = tokenizer.decode(out[0][input_ids.shape[1]:], skip_special_tokens=True)
                 predicted = extract_answer(answer_text)
                 if predicted == q["correct"]:
@@ -157,9 +131,55 @@ def evaluate(poll: bool = False):
                 if total < 3:
                     print(f"  ⚠ {e}")
                 total += 1
-
+        del std_model
+        torch.cuda.empty_cache()
         acc = correct / total * 100 if total > 0 else 0
         print(f"  Baseline: {correct}/{total} ({acc:.1f}%)")
+        return {"correct": correct, "total": total, "accuracy": acc}
+
+    def run_cartridge_eval(ckpt_path, label=""):
+        """Eval with FlexLlama + cartridge checkpoint."""
+        print(f"  Loading FlexLlamaForCausalLM...")
+        flex_model = FlexLlamaForCausalLM.from_pretrained(MODEL, torch_dtype=torch.bfloat16).cuda().eval()
+
+        ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+        if "fixed_keys" in ckpt and "frozen_keys" not in ckpt:
+            ckpt["frozen_keys"] = ckpt.pop("fixed_keys")
+            ckpt["frozen_values"] = ckpt.pop("fixed_values")
+            torch.save(ckpt, ckpt_path)
+        del ckpt
+        cache = TrainableCache.from_pretrained(ckpt_path).cuda()
+        print(f"  Cache: {cache._num_trainable_tokens} trainable tokens")
+
+        correct = 0
+        total = 0
+        for q in eval_qs:
+            try:
+                ids = tokenizer.encode(q["prompt"])
+                input_ids = torch.tensor(ids, dtype=torch.long, device="cuda")
+                seq_ids = torch.zeros_like(input_ids)
+                position_ids = torch.arange(len(ids), dtype=torch.long, device="cuda")
+                cache.clear()
+                completions = flex_generate(
+                    model=flex_model, tokenizer=tokenizer,
+                    input_ids=input_ids, seq_ids=seq_ids, position_ids=position_ids,
+                    cache=cache, max_new_tokens=10, temperature=0.0,
+                )
+                gen_ids = completions.get(0, [])
+                answer_text = tokenizer.decode(gen_ids, skip_special_tokens=True)
+                predicted = extract_answer(answer_text)
+                if predicted == q["correct"]:
+                    correct += 1
+                total += 1
+            except Exception as e:
+                if total < 3:
+                    print(f"  ⚠ {e}")
+                total += 1
+
+        del flex_model, cache
+        torch.cuda.empty_cache()
+        acc = correct / total * 100 if total > 0 else 0
+        print(f"  {label}: {correct}/{total} ({acc:.1f}%)")
         return {"correct": correct, "total": total, "accuracy": acc}
 
     # --- Load existing results ---
@@ -181,7 +201,7 @@ def evaluate(poll: bool = False):
     # --- Eval baseline once ---
     if "baseline" not in results:
         print("=== Baseline (no cartridge) ===")
-        results["baseline"] = eval_baseline()
+        results["baseline"] = run_baseline_eval()
         save_results()
 
     # --- Scan and eval checkpoints ---
@@ -206,25 +226,11 @@ def evaluate(poll: bool = False):
             print(f"\n=== Step {step}: {os.path.basename(ckpt_path)} ===")
 
             try:
-                # Fix key naming if needed
-                ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-                if "fixed_keys" in ckpt and "frozen_keys" not in ckpt:
-                    ckpt["frozen_keys"] = ckpt.pop("fixed_keys")
-                    ckpt["frozen_values"] = ckpt.pop("fixed_values")
-                    torch.save(ckpt, ckpt_path)
-                del ckpt
-
-                cache = TrainableCache.from_pretrained(ckpt_path).cuda()
-                print(f"  Loaded cache: {cache._num_trainable_tokens} trainable tokens")
-
-                result = eval_with_cartridge(cache, label=f"Step {step}")
+                result = run_cartridge_eval(ckpt_path, label=f"Step {step}")
                 result["step"] = step
                 results["evals"].append(result)
                 evaluated.add(step)
                 save_results()
-
-                del cache
-                torch.cuda.empty_cache()
 
             except Exception as e:
                 print(f"  ✗ Failed to eval step {step}: {e}")
@@ -237,9 +243,9 @@ def evaluate(poll: bool = False):
     save_results()
 
     if poll:
-        print("\n--- Poll mode: checking for new checkpoints every 5 min ---")
+        print("\n--- Poll mode: checking for new checkpoints every 3 min ---")
         while True:
-            time.sleep(300)
+            time.sleep(180)
             results_volume.reload()
             if scan_and_eval():
                 save_results()

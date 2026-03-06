@@ -1399,6 +1399,18 @@ class RayPPOTrainer:
             rollout_skip = RolloutSkip(self.config, self.async_rollout_manager)
             rollout_skip.wrap_generate_sequences()
 
+        # --- Cartridge step-0 checkpoint: save initial cache before any training ---
+        if getattr(self, "_cartridge_sync_enabled", False):
+            cartridge_save_freq = self.config.trainer.get("cartridge_save_freq", 128)
+            if cartridge_save_freq > 0:
+                save_dir = os.path.join(
+                    self.config.trainer.default_local_dir, "cartridge_checkpoints"
+                )
+                os.makedirs(save_dir, exist_ok=True)
+                ckpt_path = os.path.join(save_dir, f"cache-step0.pt")
+                self.actor_rollout_wg.save_cartridge(ckpt_path)
+                print(f"[cartridge] Saved step-0 checkpoint (pre-training): {ckpt_path}")
+
         # add tqdm
         progress_bar = tqdm(total=self.total_training_steps, initial=self.global_steps, desc="Training Progress")
 
