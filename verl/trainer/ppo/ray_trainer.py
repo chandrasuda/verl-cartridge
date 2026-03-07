@@ -1544,37 +1544,59 @@ class RayPPOTrainer:
                             policy_loss_config=self.config.actor_rollout_ref.actor.policy_loss,
                         )
                     else:  # Recompute old_log_probs
-                        with marked_timer("old_log_prob", timing_raw, color="blue"):
-                            old_log_prob, old_log_prob_mfu = self._compute_old_log_prob(batch)
-                            entropys = old_log_prob.batch["entropys"]
-                            response_masks = batch.batch["response_mask"]
-                            actor_config = self.config.actor_rollout_ref.actor
-                            entropy_agg = agg_loss(
-                                loss_mat=entropys,
-                                loss_mask=response_masks,
-                                loss_agg_mode=actor_config.loss_agg_mode,
-                                loss_scale_factor=actor_config.loss_scale_factor,
-                            )
-                            old_log_prob_metrics = {
-                                "actor/entropy": entropy_agg.detach().item(),
-                                "perf/mfu/actor_infer": old_log_prob_mfu,
-                            }
-                            metrics.update(old_log_prob_metrics)
-                            old_log_prob.batch.pop("entropys")
-                            if "routed_experts" in batch.batch and "routed_experts" in old_log_prob.batch:
-                                router_mode = getattr(
-                                    self.config.actor_rollout_ref.actor.router_replay, "mode", "disabled"
+                        # Skip old_log_prob for cartridge distillation: with ppo_epochs=1 and
+                        # ppo_mini_batch_size=batch_size, update_policy sets on_policy=True and
+                        # replaces old_log_prob with log_prob.detach(). The separate forward
+                        # pass is wasted compute (~14s/step).
+                        cartridge_cfg = getattr(self.config.actor_rollout_ref.actor, "cartridge", None)
+                        skip_old_lp = (
+                            cartridge_cfg is not None
+                            and getattr(cartridge_cfg, "enabled", False)
+                            and self.config.actor_rollout_ref.actor.ppo_epochs == 1
+                        )
+                        if skip_old_lp:
+                            with marked_timer("old_log_prob", timing_raw, color="blue"):
+                                # Inject zeros — update_policy will overwrite with log_prob.detach()
+                                response_length = batch.batch["responses"].shape[-1]
+                                batch_size = batch.batch["responses"].shape[0]
+                                import torch
+                                zeros = torch.zeros(batch_size, response_length)
+                                old_log_prob = DataProto.from_dict(tensors={
+                                    "old_log_probs": zeros,
+                                })
+                                batch = batch.union(old_log_prob)
+                                metrics.update({"actor/entropy": 0.0, "perf/mfu/actor_infer": 0})
+                        else:
+                            with marked_timer("old_log_prob", timing_raw, color="blue"):
+                                old_log_prob, old_log_prob_mfu = self._compute_old_log_prob(batch)
+                                entropys = old_log_prob.batch["entropys"]
+                                response_masks = batch.batch["response_mask"]
+                                actor_config = self.config.actor_rollout_ref.actor
+                                entropy_agg = agg_loss(
+                                    loss_mat=entropys,
+                                    loss_mask=response_masks,
+                                    loss_agg_mode=actor_config.loss_agg_mode,
+                                    loss_scale_factor=actor_config.loss_scale_factor,
                                 )
-                                if router_mode == "R2":
-                                    batch.batch.pop("routed_experts")
-                                else:
-                                    old_log_prob.batch.pop("routed_experts")
-                            batch = batch.union(old_log_prob)
-                            if "rollout_log_probs" in batch.batch.keys():
-                                # TODO: we may want to add diff of probs too.
-                                from verl.utils.debug.metrics import calculate_debug_metrics
+                                old_log_prob_metrics = {
+                                    "actor/entropy": entropy_agg.detach().item(),
+                                    "perf/mfu/actor_infer": old_log_prob_mfu,
+                                }
+                                metrics.update(old_log_prob_metrics)
+                                old_log_prob.batch.pop("entropys")
+                                if "routed_experts" in batch.batch and "routed_experts" in old_log_prob.batch:
+                                    router_mode = getattr(
+                                        self.config.actor_rollout_ref.actor.router_replay, "mode", "disabled"
+                                    )
+                                    if router_mode == "R2":
+                                        batch.batch.pop("routed_experts")
+                                    else:
+                                        old_log_prob.batch.pop("routed_experts")
+                                batch = batch.union(old_log_prob)
+                                if "rollout_log_probs" in batch.batch.keys():
+                                    from verl.utils.debug.metrics import calculate_debug_metrics
 
-                                metrics.update(calculate_debug_metrics(batch))
+                                    metrics.update(calculate_debug_metrics(batch))
 
                     assert "old_log_probs" in batch.batch, f'"old_log_prob" not in {batch.batch.keys()=}'
 
