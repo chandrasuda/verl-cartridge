@@ -1557,10 +1557,9 @@ class RayPPOTrainer:
                         if skip_old_lp:
                             with marked_timer("old_log_prob", timing_raw, color="blue"):
                                 # Inject zeros — update_policy will overwrite with log_prob.detach()
-                                import torch as _torch
                                 response_length = batch.batch["responses"].shape[-1]
-                                batch_size = batch.batch["responses"].shape[0]
-                                zeros = _torch.zeros(batch_size, response_length)
+                                batch_size_lp = batch.batch["responses"].shape[0]
+                                zeros = batch.batch["responses"].new_zeros(batch_size_lp, response_length, dtype=torch.float32)
                                 old_log_prob = DataProto.from_dict(tensors={
                                     "old_log_probs": zeros,
                                 })
