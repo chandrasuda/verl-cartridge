@@ -1096,10 +1096,26 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def save_cartridge(self, path: str):
-        """Save the updated TrainableCache to disk (for Tokasaurus sync)."""
+        """Save the updated TrainableCache to disk (for Tokasaurus sync).
+
+        Important: we clone the tensors before saving because FSDP wraps
+        all parameters into a single FlatParameter buffer.  Without .clone(),
+        torch.save serializes the entire 6.4 GB flat buffer for every
+        28-layer ParameterList entry, producing a ~6 GB checkpoint instead
+        of the expected ~29 MB (for 512-token cartridge).
+        """
         if self._cartridge_cache is not None and self.rank == 0:
-            self._cartridge_cache.save(path)
-            print(f"[cartridge] Saved cache to {path}")
+            cache = self._cartridge_cache
+            import torch as _t
+            _t.save({
+                "trainable_keys": [k.data.clone() for k in cache.trainable_keys],
+                "trainable_values": [v.data.clone() for v in cache.trainable_values],
+                "frozen_keys": [k.data.clone() for k in cache.frozen_keys] if cache.frozen_keys else [],
+                "frozen_values": [v.data.clone() for v in cache.frozen_values] if cache.frozen_values else [],
+            }, path)
+            import os
+            sz_mb = os.path.getsize(path) / 1e6
+            print(f"[cartridge] Saved cache to {path} ({sz_mb:.1f} MB)")
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
     @DistProfiler.annotate(color="red", role="actor_update")
