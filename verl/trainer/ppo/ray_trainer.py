@@ -1553,6 +1553,7 @@ class RayPPOTrainer:
                 ckpt_path = os.path.join(save_dir, f"cache-step0.pt")
                 self.actor_rollout_wg.save_cartridge(ckpt_path)
                 print(f"[cartridge] Saved step-0 checkpoint (pre-training): {ckpt_path}")
+                self._eval_cartridge_on_longhealth(ckpt_path, step=0)
 
         # add tqdm
         progress_bar = tqdm(total=self.total_training_steps, initial=self.global_steps, desc="Training Progress")
