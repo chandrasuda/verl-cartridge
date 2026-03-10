@@ -1292,6 +1292,149 @@ class RayPPOTrainer:
                 )
             print(f"[cartridge] Synced updated cartridge to Tokasaurus: {cartridge_path}")
 
+    def _eval_cartridge_on_longhealth(self, ckpt_path: str, step: int):
+        """Evaluate a cartridge checkpoint on the full LongHealth benchmark.
+
+        Loads FlexLlama + the saved cartridge, generates answers to ALL
+        LongHealth MC questions using flex_generate, scores accuracy, and
+        saves results incrementally to /results/onpolicy/eval_scores.json
+        (compatible with plot_comparison.py).
+
+        This runs on the training GPU — takes ~2-4 minutes per eval.
+        """
+        import json, re, time, os
+        import torch
+
+        eval_json_path = os.path.join(
+            self.config.trainer.default_local_dir, "eval_scores.json"
+        )
+
+        # Lazy-load eval resources (first call only)
+        if not hasattr(self, "_longhealth_eval_qs"):
+            import requests as http_req
+            print(f"\n[cartridge-eval] Loading LongHealth questions...")
+            data = http_req.get(
+                "https://raw.githubusercontent.com/kbressem/LongHealth/refs/heads/main/data/benchmark_v5.json"
+            ).json()
+            self._longhealth_eval_qs = []
+            for pid, patient in data.items():
+                for q in patient["questions"]:
+                    options = "\n".join(f"{L}) {q[f'answer_{L.lower()}']}" for L in "ABCDE")
+                    prompt = (
+                        f"You are answering a multiple choice question about patient {patient['name']}.\n\n"
+                        f"Question: {q['question']}\n\nOptions:\n{options}\n\n"
+                        f"Answer with ONLY the letter (A, B, C, D, or E):"
+                    )
+                    answer_map = {q[f"answer_{L.lower()}"]: L for L in "ABCDE"}
+                    self._longhealth_eval_qs.append({
+                        "prompt": prompt,
+                        "correct": answer_map.get(q["correct"], "?"),
+                    })
+            print(f"[cartridge-eval] {len(self._longhealth_eval_qs)} questions loaded")
+
+            # Init eval results list
+            self._eval_results = {"method": "on_policy", "evals": []}
+
+        if not hasattr(self, "_eval_flex_model"):
+            from cartridges.models.llama.modeling_llama import FlexLlamaForCausalLM
+            model_name = self.config.actor_rollout_ref.model.path
+            print(f"[cartridge-eval] Loading FlexLlama for eval ({model_name})...")
+            self._eval_flex_model = FlexLlamaForCausalLM.from_pretrained(
+                model_name, torch_dtype=torch.bfloat16
+            ).cuda().eval()
+            from transformers import AutoTokenizer
+            self._eval_tokenizer = AutoTokenizer.from_pretrained(model_name)
+            print(f"[cartridge-eval] FlexLlama ready for eval")
+
+        # Load the checkpoint
+        from cartridges.cache import TrainableCache, AttnConfig
+        from cartridges.generation import flex_generate
+
+        try:
+            ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+            if "fixed_keys" in ckpt and "frozen_keys" not in ckpt:
+                ckpt["frozen_keys"] = ckpt.pop("fixed_keys")
+                ckpt["frozen_values"] = ckpt.pop("fixed_values")
+
+            trainable_keys = ckpt["trainable_keys"]
+            frozen_keys = ckpt["frozen_keys"]
+            n_layers = len(trainable_keys)
+            n_heads = trainable_keys[0].size(1)
+            head_dim = trainable_keys[0].size(3)
+            num_frozen = frozen_keys[0].size(2) if frozen_keys else 0
+
+            init_keys = [
+                torch.cat([frozen_keys[i], trainable_keys[i]], dim=2).contiguous()
+                if num_frozen > 0 else trainable_keys[i]
+                for i in range(n_layers)
+            ]
+            init_values = [
+                torch.cat([ckpt["frozen_values"][i], ckpt["trainable_values"][i]], dim=2).contiguous()
+                if num_frozen > 0 else ckpt["trainable_values"][i]
+                for i in range(n_layers)
+            ]
+            cache = TrainableCache(
+                config=AttnConfig(n_layers=n_layers, n_heads=n_heads, head_dim=head_dim),
+                init_keys=init_keys, init_values=init_values,
+                num_frozen_tokens=num_frozen,
+            ).cuda()
+            del ckpt
+        except Exception as e:
+            print(f"[cartridge-eval] Failed to load {ckpt_path}: {e}")
+            return
+
+        # Run eval on ALL questions
+        t0 = time.time()
+        tokenizer = self._eval_tokenizer
+        correct = 0
+        total = len(self._longhealth_eval_qs)
+
+        def extract_answer(text):
+            m = re.search(r'\b([A-E])\b', text.strip()[:20])
+            return m.group(1) if m else "?"
+
+        for qi, q in enumerate(self._longhealth_eval_qs):
+            ids = tokenizer.encode(q["prompt"])
+            input_ids = torch.tensor(ids, dtype=torch.long, device="cuda")
+            seq_ids = torch.zeros_like(input_ids)
+            position_ids = torch.arange(len(ids), dtype=torch.long, device="cuda")
+            cache.clear()
+            gen_output = flex_generate(
+                model=self._eval_flex_model, tokenizer=tokenizer, cache=cache,
+                input_ids=input_ids, seq_ids=seq_ids, position_ids=position_ids,
+                max_new_tokens=10, temperature=0.0,
+            )
+            gen_tokens = gen_output.get(0, [])
+            gen_text = tokenizer.decode(gen_tokens, skip_special_tokens=True)
+            pred = extract_answer(gen_text)
+            if pred == q["correct"]:
+                correct += 1
+
+        acc = correct / total * 100
+        elapsed = time.time() - t0
+        total_tokens = step * 32 * 350  # approx tokens seen
+
+        print(f"\n{'='*60}")
+        print(f"  EVAL @ step {step}: {correct}/{total} ({acc:.1f}%) [{elapsed:.0f}s]")
+        print(f"{'='*60}\n")
+
+        self._eval_results["evals"].append({
+            "optimizer_step": step,
+            "total_tokens": total_tokens,
+            "scores": {"score": round(acc / 100, 4)},
+            "num_eval_questions": total,
+            "correct": correct,
+        })
+
+        # Save incrementally
+        os.makedirs(os.path.dirname(eval_json_path), exist_ok=True)
+        with open(eval_json_path, "w") as f:
+            json.dump(self._eval_results, f, indent=2)
+        print(f"[cartridge-eval] Saved to {eval_json_path}")
+
+        del cache
+        torch.cuda.empty_cache()
+
     def _update_actor(self, batch: DataProto) -> DataProto:
         rollout_config = self.config.actor_rollout_ref.rollout
         batch.meta_info["multi_turn"] = rollout_config.multi_turn.enable
@@ -1702,7 +1845,7 @@ class RayPPOTrainer:
                             with marked_timer("cartridge_sync", timing_raw, color="yellow"):
                                 self._sync_cartridge_to_tokasaurus()
 
-                        # --- Cartridge checkpoint: save cache .pt for later eval ---
+                        # --- Cartridge checkpoint + LongHealth eval ---
                         if getattr(self, "_cartridge_sync_enabled", False):
                             cartridge_save_freq = self.config.trainer.get("cartridge_save_freq", 128)
                             if cartridge_save_freq > 0 and (
@@ -1715,6 +1858,9 @@ class RayPPOTrainer:
                                 ckpt_path = os.path.join(save_dir, f"cache-step{self.global_steps}.pt")
                                 self.actor_rollout_wg.save_cartridge(ckpt_path)
                                 print(f"[cartridge] Saved checkpoint: {ckpt_path}")
+
+                                # Run LongHealth eval on this checkpoint
+                                self._eval_cartridge_on_longhealth(ckpt_path, self.global_steps)
 
                         actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                         metrics.update(actor_output_metrics)
