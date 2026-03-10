@@ -113,7 +113,10 @@ def main():
             max_new_tokens=10, temperature=0.0,
         )
         gen_tokens = gen_output.get(0, [])
-        pred = extract_answer(tokenizer.decode(gen_tokens, skip_special_tokens=True))
+        gen_text = tokenizer.decode(gen_tokens, skip_special_tokens=True)
+        pred = extract_answer(gen_text)
+        if qi < 5:
+            print(f"  Q{qi}: gen='{gen_text[:80]}' pred={pred} correct={q['correct']}")
         if pred == q["correct"]:
             correct += 1
 
