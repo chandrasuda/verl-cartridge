@@ -1305,6 +1305,17 @@ class RayPPOTrainer:
         import json, re, time, os
         import torch
 
+        # Ray hides GPUs from the TaskRunner actor (GPU allocated to WorkerDict).
+        # Override CUDA_VISIBLE_DEVICES before any torch.cuda call so we can
+        # share the physical GPU for eval.
+        if os.environ.get("CUDA_VISIBLE_DEVICES", "") == "":
+            os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+            print(f"[cartridge-eval] Overrode CUDA_VISIBLE_DEVICES=0 (was empty from Ray)")
+
+        if not torch.cuda.is_available():
+            print(f"[cartridge-eval] No CUDA GPU available, skipping eval at step {step}")
+            return
+
         eval_json_path = os.path.join(
             self.config.trainer.default_local_dir, "eval_scores.json"
         )
