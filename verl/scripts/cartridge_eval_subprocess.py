@@ -27,6 +27,17 @@ from cartridges.cache import AttnConfig, TrainableCache
 from cartridges.generation import flex_generate
 from cartridges.models.llama.modeling_llama import FlexLlamaForCausalLM
 
+# Device detection
+if torch.cuda.is_available():
+    DEVICE = "cuda"
+    DTYPE = torch.bfloat16
+elif torch.backends.mps.is_available():
+    DEVICE = "mps"
+    DTYPE = torch.float32
+else:
+    DEVICE = "cpu"
+    DTYPE = torch.float32
+
 
 def extract_answer(text):
     m = re.search(r"\b([A-E])\b", text.strip()[:20])
@@ -70,9 +81,9 @@ def main():
     # ---- Load model ----
     tokenizer = AutoTokenizer.from_pretrained(args.model)
     model = FlexLlamaForCausalLM.from_pretrained(
-        args.model, torch_dtype=torch.bfloat16
-    ).cuda().eval()
-    print(f"[subprocess-eval] Model loaded: {args.model}")
+        args.model, torch_dtype=DTYPE
+    ).to(DEVICE).eval()
+    print(f"[subprocess-eval] Model loaded: {args.model} on {DEVICE}")
 
     # ---- Load cache checkpoint ----
     ckpt = torch.load(args.ckpt, map_location="cpu", weights_only=False)
@@ -97,7 +108,7 @@ def main():
     cache = TrainableCache(
         config=AttnConfig(n_layers=nl, n_heads=nh, head_dim=hd),
         init_keys=ik, init_values=iv, num_frozen_tokens=nf,
-    ).cuda()
+    ).to(DEVICE)
     del ckpt
     print(f"[subprocess-eval] Cache loaded: {nl} layers, {nh} heads, {nf} frozen tokens")
 
@@ -106,9 +117,9 @@ def main():
     correct = 0
     for qi, q in enumerate(questions):
         ids = tokenizer.encode(q["prompt"])
-        input_ids = torch.tensor(ids, dtype=torch.long, device="cuda")
+        input_ids = torch.tensor(ids, dtype=torch.long, device=DEVICE)
         seq_ids = torch.zeros_like(input_ids)
-        position_ids = torch.arange(len(ids), dtype=torch.long, device="cuda")
+        position_ids = torch.arange(len(ids), dtype=torch.long, device=DEVICE)
         cache.clear()
         gen_output = flex_generate(
             model=model, tokenizer=tokenizer, cache=cache,
