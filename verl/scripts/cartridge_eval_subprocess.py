@@ -41,13 +41,16 @@ def main():
     parser.add_argument("--eval-json", required=True, help="Path to write eval results")
     args = parser.parse_args()
 
-    # ---- Load LongHealth questions ----
+    # ---- Load LongHealth questions (10 training patients only, matches paper) ----
+    EVAL_PATIENT_IDS = {f"patient_{i:02d}" for i in range(1, 11)}
     data = http_req.get(
         "https://raw.githubusercontent.com/kbressem/LongHealth/"
         "refs/heads/main/data/benchmark_v5.json"
     ).json()
     questions = []
     for pid, patient in data.items():
+        if pid not in EVAL_PATIENT_IDS:
+            continue
         for q in patient["questions"]:
             options = "\n".join(
                 L + ") " + q["answer_" + L.lower()] for L in "ABCDE"
